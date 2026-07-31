@@ -1,0 +1,382 @@
+# CuTe 学习交接文件 (memory.md)
+
+> 用途:对话上下文太长时,新开对话对 Claude 说「load 这个 memory.md,我们继续」,
+> Claude 读完即可无缝接上学习进度,不用重新对齐。
+> 每次学完一块,让 Claude 更新本文件的「当前进度」和「已掌握」。
+
+---
+
+## 学习者画像
+
+- **目标**:熟练使用 CuTe 和 CUTLASS。当前聚焦 CuTe。
+- **路线**:C++ 模板版(不是 Python DSL)。
+- **C++ 底子**:日常 C++ 没问题,但模板元编程 / SFINAE 一般,长模板报错会发怵。
+- **因此的教学约定**:
+  - 学 layout 阶段优先用**运行时值** `make_layout(make_shape(8,4), make_stride(1,8))`,
+    而非编译期 `Int<8>{}`——报错短、能 print。概念通了再换编译期版本。
+  - 模板报错先看**第一行和最后一行**,中间展开先跳过。
+  - 模板元编程**按需补**,不专门啃。只需看懂 `Int<N>{}` / `make_tuple` / `auto` 返回值。
+
+## 核心学习方法(每次都遵守)
+
+1. **打印驱动**:每个概念都写 host `main()` 用 `print` / `print_layout` 打印出来验证,不只看文档。
+2. **手算先行**:先在纸上预测结果,再编译对答案。对不上的地方就是理解漏洞。
+3. **一个概念一个文件**:layout.cpp / algebra.cpp / tensor.cpp ... 攒起来,不互相覆盖。
+4. 慢在 Layout 就是快——CuTe 难点 90% 在 Layout 代数(composition / product / divide)。
+5. **原理 + 实用性双轨(最终目标,务必贯彻)**:学习者的目标是「非常熟悉每一个 CuTe
+   特性」,不满足于「知道原理/是什么」。每讲一个特性,除了讲清原理,**必须补上实用性质**:
+   - 它能拿来做什么?什么真实场景会有意使用它?对应什么硬件/性能动机?
+   - 有哪些非显然的用法(如「非单射 → 广播」这种一开始想不到的)。
+   记「已掌握」时,原理和用途都要写下来,不能只留原理。
+6. **留档取舍(学习者偏好)**:只记真正非显然的原理、设计哲学、容易再次困惑的点。
+   基础工具函数(如 rank/depth/take/get 这类 API)**不留档**,需要时现查即可,不写进「已掌握」。
+
+---
+
+## 环境(已全部跑通)
+
+- 仓库根:`/cpfs/user/baiheng/code/cutlass`
+- 练习目录:`.vscode/cute-learn/`
+- CUDA:`/usr/local/cuda`(nvcc 12.9),纯 layout 代码不需要 GPU 即可编译运行。
+- 已配好:
+  - `.vscode/c_cpp_properties.json`(include path + `__CUDACC__`,IntelliSense 用)
+  - `.vscode/cute-learn/Makefile`
+  - `.vscode/tasks.json`
+
+**两种编译运行方式(等价,同一条 nvcc 命令):**
+
+- 终端:`cd .vscode/cute-learn && make run`(默认跑 layout.cpp;`make run F=algebra` 跑别的)
+- VSCode:打开某个 .cpp,按 `Ctrl+Shift+B`,自动编译+运行当前文件
+
+裸命令(备用):
+`nvcc -I include -I tools/util/include -std=c++17 -Wno-deprecated-gpu-targets 文件.cpp -o 输出 && ./输出`
+
+---
+
+## 官方材料位置(仓库内,按学习顺序)
+
+| 顺序 | 文件 |
+|------|------|
+| 1 | `media/docs/cpp/cute/00_quickstart.md` |
+| 2 | `media/docs/cpp/cute/01_layout.md` |
+| 3 | `media/docs/cpp/cute/02_layout_algebra.md`  ⚠️最难,预计花 2-3 倍时间 |
+| 4 | `media/docs/cpp/cute/03_tensor.md` |
+| 5 | `media/docs/cpp/cute/04_algorithms.md` |
+| 6 | `examples/cute/tutorial/sgemm_1.cu` → `sgemm_2.cu` |
+| 后续 | `0t_mma_atom.md` / `0x_gemm_tutorial.md` / `0y_predication.md` / `0z_tma_tensors.md` |
+
+## 计划节奏(可调整)
+
+- 第 1 周:00 + 01,能手算 layout(coord)→偏移,能画图
+- 第 2-3 周:02 layout 代数(最难)
+- 第 4 周:03 tensor + 04 algorithms(local_tile / local_partition / copy / gemm)
+- 第 5 周:读懂 sgemm_1/2,自己改 tile 跑通
+- 之后:MMA / TMA / predication 按需
+
+---
+
+## 当前进度
+
+- [x] 方向确认、路线定案、环境搭好、编译链路跑通
+- [x] 见过第一张 layout 图:`(8,4):(1,8)` = 列主序
+      映射:偏移 = 行×stride[0] + 列×stride[1] = 行×1 + 列×8
+- [ ] **进行中的练习**:把 `layout.cpp` 的 stride 改成 `(4,1)`,预测图再验证(理解行主序 vs 列主序)
+- [ ] 尚未正式开讲 01_layout.md 的完整内容
+
+## 已掌握的概念(逐步累积)
+
+> 格式:每条 = 原理 +【用途】实用性质 / 应用场景。
+
+- **Layout = Shape + Stride**;layout(坐标) → 内存偏移 这个映射是 CuTe 的本质。
+  - 【用途】所有 CuTe 数据访问的基石;把「逻辑索引」和「物理内存排布」解耦,
+    换 layout 就能换访存模式而不改算法代码。
+
+- **列主序 vs 行主序**:stride 小的维度变化快。`(8,4):(1,8)` 列主序(同列内存连续);
+  `(8,4):(4,1)` 行主序(同行内存连续)。
+  - 【用途】匹配数据在内存里的真实排布 / 决定访存是否合并(coalesced);
+    选错主序会让 warp 访存不连续,直接掉性能。
+
+- **Layout 允许非单射(non-injective)**:多个坐标映射到同一偏移是合法的,CuTe 不禁止。
+  - CuTe 只检查**结构匹配**(shape 与 stride 的 rank 要一致),**不检查**是否一一对应。
+  - "是否单射"是使用者的语义责任:存数据通常要单射(否则互相覆盖);广播/复用则故意非单射。
+  - 例:`(8,4):(8,8)` 有坐标碰撞但合法;`stride=0` 是故意广播(该维坐标不影响偏移)。
+  - 本质原因:Layout 数学上就是"坐标→整数"的函数,函数本就可以不是单射。
+  - 真·非法只有结构对不上(如 shape 2 维、stride 给 3 个)→ 编译报错。
+  - 【用途】**广播**:`stride=0` 让一份数据被多个坐标复用(如 bias 向量按行广播到矩阵、
+    A/B 矩阵在某维度对所有线程共享),省内存、省重复加载。
+
+- **cute::tuple**:CuTe 自造的 `std::tuple` 替代品,是 Shape/Stride/Layout 的底层容器。
+  `make_shape`/`make_stride` 返回的都是它。源码:`include/cute/container/tuple.hpp`。
+  四个关键区别(各对应一个 GPU 硬约束):
+  1. host+device 都能用(std::tuple 成员没标 __device__)。
+  2. 参数须 semiregular(可默认构造+可拷贝),禁引用类型 → 保证能安全拷进显存。
+  3. **standard-layout**:ABI 跨 host/device 一致 → Layout 可**直接当 kernel 参数**传,不错位。
+  4. **ESO(空结构优化)**:元素若是空类型(编译期常量)则**零存储**。
+  - **`Int<8>{}`(=`_8{}`) vs `8`**:前者是编译期常量(类型即值,零存储,可被编译器优化,
+    如地址计算/循环展开在编译期完成);后者是运行时 int(占内存,值运行时才知)。
+    实测 sizeof:`(8,4)`=8B,`(_8,_4)`=1B(ESO),`(8,_4)`=4B(只有动态部分占空间)。
+  - 【用途】固定维度(tile 大小如 128)用 `Int<128>{}` → 零开销+可优化;
+    只有运行时才知的维度(如矩阵 M/N/K)才用普通 int。CuTe kernel 里大量 `_128{}`/`_64{}` 即此。
+  - **tuple 可嵌套** → 这是「层次化 shape」的来源:`make_shape(make_shape(2,4),4)` 的 rank=2
+    (外层 2 个元素,首元素本身是 tuple)。是 CuTe 表达分块/多级 tiling 的基础。
+  - **Shape 与 Stride 本质同类型**(都是 tuple),`Shape`/`Stride` 只是语义标签;
+    操作 tuple 的工具对两者通用。
+  - 练习文件:`.vscode/cute-learn/tuple.cpp`。
+
+- **部分静态 tuple(动/静态混合)的实现原理**——三块机制咬合:
+  1. **`Int<4>` = `C<4>` 是空类型**(`include/cute/numeric/integral_constant.hpp`):
+     值 `4` 用 `static constexpr value` 编码在**模板参数/类型**里,无非静态数据成员 → sizeof=1。
+     数字成了「类型身份」的一部分,`C<4>` 与 `C<8>` 是不同类型;编译器直接把它当立即数编进指令。
+  2. **ESO 逐元素检测 `is_empty` 并选特化**:tuple 递归成 `first_ + rest_`(head+tail),
+     每层判断当前元素空不空 → 空的选「不建成员」特化(构造函数收下参数但丢弃),
+     非空的选「建 first_ 成员」特化。所以动态元素存、静态元素不存,共处一个 tuple。
+  3. **`get<N>` 取值**:空类型 `return {}` 凭空重建(无数据,等价);非空才去内存捞。
+  - 整条链(is_empty 判断/特化选择/if constexpr)**全在编译期**,运行时只剩几条 int 赋值 → 零开销。
+
+- **构造调用栈实例:`make_shape(8, Int<4>{}, 2)`**(完整展开,记录于此备查):
+  - `Ts...` 推导为 `{int, C<4>, int}`;`Shape<...>` 就是 `tuple<int,C<4>,int>`(Shape 是 tuple 别名)。
+  - `make_shape` → `return {8, C<4>{}, 2}` 列表初始化 tuple;tuple 继承 `ESO_t`,构造函数转发给基类。
+  - 递归下降,每层剥一个元素:
+    - 第1层 `ESO<false,false,int,C<4>,int>`:`first_{8}` 建 int 存 8,rest 传 `{C<4>{},2}`。
+    - 第2层 `ESO<true,false,C<4>,int>`:First 空 → 构造函数**收下 C<4>{} 但不建成员**(静态零存储瞬间),rest 传 `{2}`。
+    - 第3层 `ESO<false,true,int>`:`first_{2}` 建 int 存 2,递归到底。
+  - 最终内存 = `[int(8)][int(2)]` = 8B,`C<4>` 不在内存里(活在类型中)。
+  - 洞察:构造过程本身就是在「head+tail 递归链」上逐节点决策建不建成员,与 tuple 的递归定义哲学一一对应。
+
+- **CuTe 编译期递归的两种通用范式**(贯穿全库:depth/rank/size/shape/product/layout 代数都用):
+  1. **`is_tuple` 分流 + `apply` 摊包 + 包展开递归**(如 `depth`,`include/cute/int_tuple.hpp`):
+     标量=base case,tuple=`1+max(子递归...)`;`is_tuple` 编译期判枝叶,
+     `cute::apply(t, lambda)` 把异构 tuple 摊成参数包 `v...`(因异构不能 for 循环遍历),
+     `depth(v)...` 包展开触发子递归。全 constexpr → 结果是 `Int<N>` 编译期常量,运行时零成本。
+  2. **变参 `get<I0,I1,...>` = 剥最左索引 + 递归 + 重载消解终止**:
+     `get<I0,I1,Is...>(t) = get<I1,Is...>(get<I0>(t))`,每次剥一个索引钻一层(路径导航);
+     终止不靠 if,靠重载匹配:剩 1 索引→单索引 get 取值停;标量的 `get<0>` 返回自身
+     (CuTe 定义 rank(标量)=1,把标量当单元素 tuple,让标量/tuple 走同一套递归)。
+     所有 `func<Is...>`(rank/shape/size<Is...>)都先用变参 get 定位子结构,再对它运算。
+  - 洞察:吃透这两个最小样本(depth + 变参 get),后面复杂 layout 代数都能一眼看穿骨架。
+
+- **Layout 本质 = 函数「坐标 → 内存偏移」,可直接调用**:`a(3,2)` 就是调用它算偏移。
+
+- **size / cosize / range 辨析(核心,易混,直接决定内存分配)**:用数学三概念对应:
+  - **domain(定义域)= `size`**:所有合法输入坐标数 = 各 shape 之积。
+    实用:**线程/元素个数**(要处理多少数据)。
+  - **codomain(陪域)= `cosize`**:输出可能落入的整个区间 `[0, max]` 的大小 = `a(size-1)+1`
+    = 最大偏移+1。实用:**底层至少要分配多少个元素**(buffer 大小)。
+  - **range(值域)**:实际被映射到的偏移集合(那 size 个真实地址)。
+  - 关键:文档特意用 **codomain 而非 range** 定义 cosize —— cosize 按**最大偏移**算,
+    **不管中间有没有空洞**(没被映射到的地址也算进去)。因为你会用最大偏移去写数据,
+    buffer 必须够到最大偏移,哪怕中间的格子永远不碰。cosize 回答「最远写到哪」,不是「用了几格」。
+  - 例:`(8,4):(2,16)` → size=32, cosize=63(max=7*2+3*16=62,+1)。中间大量地址空洞。
+        `(8,4):(1,8)` → size=cosize=32(无空洞)。
+  - **compact(紧致)判定:`size == cosize` ⟺ 无空洞、数据紧密**。
+    【用途】compact 才能整块 memcpy;开 smem buffer 按 cosize 开(否则最大偏移越界);
+    空洞常是故意的(规避 bank conflict / 从大 tensor 切下的非连续 sub-tile)。
+  - 练习文件:`.vscode/cute-learn/layout.cpp`。
+
+- **一维坐标 → 多维坐标怎么拆(索引的总机制)**:两步,分开看就不乱。
+  1. **拆坐标**:把一维 `j` 按 shape 拆成 `(j0,j1,...)`,规则 = **像拆十进制的个位十位,
+     但每位的进制换成对应维的 shape**。第一维是"个位",变化最快。
+     公式:`j0=j%s0`,`j1=j/s0%s1`,`j2=j/(s0*s1)%s2`... **这一步只看 shape,和 stride 无关**。
+  2. **算偏移**:拆出的 `(j0,j1,...)` 和 stride 点积 → `off = j0*d0+j1*d1+...`。stride 只在这步用。
+  - 记牢:拆分永远规规矩矩(只依赖 shape);偏移看起来"乱序"是 stride 造成的,不是拆分。
+    例:shape `(2,2)` 下 j=0,1,2,3 永远拆成 (0,0)(1,0)(0,1)(1,1);
+    配 stride (2,1) 得偏移 0,2,1,3(交错来自 stride),配 (1,2) 得 0,1,2,3。
+  - 这也是「一维坐标能索引多维 layout」`a(9)==a(1,1)` 的原理;层次化 mode 的交错同理。
+  - 练习文件:`.vscode/cute-learn/coord.cpp`。
+
+- **compatible(兼容)—— layout 代数的地基概念(一开始难懂,务必记牢)**:
+  文档 `02_layout_algebra.md` / `01_layout.md:349`。
+  - **定义(大白话)**:「A compatible B」读作 **A ≤ B,即 B 是 A 的更细划分**。
+    成立条件:① `size(A)==size(B)`(总数相同)② B 是把 A 的某些维度再切细得到的。
+    方向性:A compatible B 意思是「B 比 A 更细(或相等)」。
+  - 例:`24`✓`(4,6)`✓`((2,2),6)`✓`((2,2),(3,2))`(一路细分,总数都=24);
+    `24` ✗ `32`(总数不同);`((2,3),4)` ✗ `((2,2),(3,2))`(都=24 但结构对不上,不可比)。
+  - **它是 Shapes 上的弱偏序(weak partial order)**,即满足三性质(类比整数 `≤`):
+    - 自反:A 兼容 A(≤ 自己)。
+    - 反对称:A 兼容 B 且 B 兼容 A ⟹ A==B(不可能互相比对方细)。
+    - 传递:A 兼容 B 且 B 兼容 C ⟹ A 兼容 C(细分可接力)。
+  - **"偏(partial)"= 有些 shape 谁也不兼容谁(不可比)**,如上面 `((2,3),4)` vs `((2,2),(3,2))`。
+    对比整数 `≤` 是全序(任意两个可比);兼容是偏序(有的可比有的不可比)。
+  - **"弱(weak)"= 允许相等**(对应 `≤` 而非 `<`),因为自反性把「相等」也算进序里。
+  - 【用途】是 layout 代数的类型约束:composition / logical_divide / tiling 等要求 shape 兼容,
+    否则无意义或编译报错(文档里的 `@post compatible(...)`)。切 tile 本质就是把粗 shape 细化,
+    兼容性保证「切完能对应上坐标、能拼回去」。
+
+- **crd2idx / idx2crd(坐标 ↔ 数字,源码 `include/cute/stride.hpp`)**:名字看似不对称,其实
+  完全对称——各有 2-arg 和 3-arg 两个重载,分别互为逆。**先分清两种"数字":**
+  - **index(一维序号)**:坐标按列主序从 0 数到 size-1 的序号,**只跟 shape 有关**。
+  - **offset(内存偏移)**:坐标乘 stride 的真实内存位置,**跟 stride 有关**。index≠offset。
+  - 四个重载:
+    - `crd2idx(c, s)` ⟷ `idx2crd(i, s)`:坐标 ↔ **index**(纯 shape,就是前面「拆/合坐标」)。
+    - `crd2idx(c, s, d)` ⟷ `idx2crd(i, s, d)`:坐标 ↔ **offset**(带 stride)。
+  - 例 `(4,2):(2,1)` 坐标 (2,1):crd2idx 2-arg=6(index),3-arg=5(offset),两者不同。
+  - 名字读法:`crd2idx`=coord→数字,`idx2crd`=数字→coord;给 2 参是 index、给 3 参是 offset。
+  - `layout(coord)` 直接调用 layout ≡ 走 3-arg `crd2idx(coord,shape,stride)`。
+  - 【反向 idx2crd 的成立条件——实测过的坑,重点】源码注释说"only works for compact",
+    但真实边界是**单射(injective)**;compact 只是 CuTe 采用的"好检查且足够强"的充分条件
+    (保证 `[0,size)` 每个 index 都合法、都对)。分级:
+    - **compact(size==cosize)**:`[0,size)` 全部正确。安全区。
+    - **单射但有空洞(size<cosize,如 `(4):(2)`)**:落在**合法 offset** 上→对(往返一致);
+      落在**空洞 offset**(如 3,5)上→静默给错坐标(往返不一致)。
+    - **非单射有碰撞(如 `(8,4):(1,1)`)**:一律静默给错(`idx2crd(6)=(6,2)`→回来是8≠6)。
+    - **广播(stride=0,如 `(8,4):(1,0)`)**:反向执行 `(idx/0)%s` → **除零崩溃**
+      (实测运行时 SIGFPE / 退出码 136;stride 是运行时值才崩到运行时,编译期 0 则编译期出错)。
+    - 正向 `crd2idx` 对以上所有情况都 OK(多坐标同 offset 正是广播/碰撞的本意)。
+  - 守则:调 3-arg `idx2crd` 前确保 layout 单射(最好 compact);CuTe **不检查**,后果自负。
+    实践中反向只出现在 tiling 拆循环变量这种天然 compact 场景。
+  - 练习文件:`.vscode/cute-learn/coord.cpp`、`hole.cpp`。
+
+- **coalesce(合并/化简)—— layout 代数第一个工具,composition 的前置**:
+  文档 `02_layout_algebra.md`。
+  - **作用**:在**不改变 layout 作为「一维函数」值**的前提下,把 mode 合并、简化成更少维度、
+    更浅 depth(相当于分数「约分」)。post-condition:`size` 不变、`depth<=1`、逐点 `result(i)==layout(i)`。
+    例:`(2,(1,6)):(1,(6,2))` → `12:1`。
+  - **规则**(flatten 后对相邻两 mode `s0:d0 ++ s1:d1` 反复应用):
+    1. `s0:d0 ++ 1:d1 => s0:d0`;2. `1:d0 ++ s1:d1 => s1:d1`(**size=1 的维度直接扔,stride 无所谓**)。
+    3. `s0:d0 ++ s1:(s0*d0) => (s0*s1):d0`(**连续判据 `d1==s0*d0`:第二维步长恰好接上第一维走满一圈→无缝→合并**)。
+    4. 否则保持两维 `(s0,s1):(d0,d1)`(有空隙,合不了)。
+  - 【用途】① 性能:动态 stride 时更少 mode = 更少运行时地址计算指令。
+    ② 规范形式:代数运算后清理冗余嵌套,便于判等/喂给下一步。
+    ③ by-mode 变体 `coalesce(layout, trg_profile)`:化简但保住指定维度结构(如保持 2D / 保留 M/N/K 分界)。
+  - **⚠️ 关键坑:合并只在「编译期可证连续」时发生**(实测):
+    - 静态 `(_2,_3,_4):(_1,_2,_6)` → 合并成 `24:1`;
+      动态 `(2,3,4):(1,2,6)`(同样数字!)→ **不合并**,原样返回。
+    - 原因:合并判据 `d1==s0*d0` 在**编译期**求值,且 coalesce 结果的 mode 数/shape 是**类型**、
+      必须编译期定死。动态 int 的相等运行时才知 → CuTe **保守不合并**(类型不能依赖运行时值)。
+    - 【守则】编译期固定的维度/stride 尽量用 `Int<>` 静态类型——不只为零存储([[cute-tuple]]),
+      更为让 coalesce/composition 等代数能真正化简/优化。CuTe kernel 里 stride 大量静态正为此。
+    - 通用原理:CuTe 代数「编译期能证明的才做,证不了一律保守」。
+  - 练习文件:`.vscode/cute-learn/coalesce.cpp`、`coaldyn.cpp`。
+
+- **composition(复合)—— layout 代数的核心,几乎所有高层操作都靠它**:文档 `02_layout_algebra.md`。
+  - **概念 = 复合函数**:`R = A o B` 定义为 `R(c) = A(B(c))`。先用 B 把坐标映射成 index,
+    再喂给 A。**B 决定定义域,A 决定去向**。结果 R 仍是一个 layout(代数封闭),
+    且 `compatible(B, R)`(R 的定义域=B 的定义域)。
+    post-condition:`for all i<size(B), R(i)==A(B(i))`。
+  - **核心机制**:composition 对 B 的各 mode 可分配(`A o (B0,B1)=(A o B0, A o B1)`),
+    所以只需搞懂最简情形 **`A o (s:d)`**,大白话 = **「从 A 里,每隔 d 个取一个,共取 s 个」**。
+    两步计算(都作用在 A 的 shape 上):
+    1. `shape / d`:跳到步长 d —— **沿前缀劈掉 d 的因子,丢前缀、保留后缀**。
+       例 `(6,2)/2=>(3,2)`,`(6,2)/6=>(1,2)`,`(3,6,2,8)/9=>(1,2,2,8)`(吃掉3、再从6劈3)。
+    2. `shape % s`:截取 s 个 —— **沿前缀凑出 s 的因子,留前缀、其余置1**。
+       例 `(6,2)%2=>(2,1)`,`(3,6,2,8)%9=>(3,3,1,1)`(3×3,第二个3从6劈出)。
+    stride 相应被 divide 的残数缩放。
+  - **⚠️ 关键认知(自己推翻了文档用词):`/` 和 `%` 都不是算术运算,是一对镜像的「shape 前缀因子分解」**:
+    `/d` 丢前缀留后缀、`%s` 留前缀丢后缀。只是**借用整数 `(x/d)%s`「跳步长/截长度」的记号和直觉**。
+    验证:纯算术下 `6%2=0`,但这里 `(6,2)%2=>(2,1)` 第一维是 2 不是 0 → 显然非取模。
+    为什么敢借记号:一维退化情形(`n:1` 纯向量)它们确实退回算术 `n/d`、`n%s`;
+    多维是把一维算术**推广**成结构分解(又一个「把 layout 当一维函数再推广」的例子)。
+  - **可除性条件(divisibility)——不满足会编译期报错**:
+    步骤1 需 stride divisibility、步骤2 需 shape divisibility,CuTe 编译期静态检查。
+    实测:`A=(6,2):(8,2) o 4:2` → 编译失败 `static assertion failed: Shape Divisibility Condition`
+    (因 4 无法沿 `(6,2)` 前缀整齐凑出)。改成 `o 3:2` 则合法。
+    → composition 不是任意两 layout 都能做,CuTe 编译期帮你挡非法组合。
+  - 练习文件:`.vscode/cute-learn/comp.cpp`。
+
+- **composition 到底干嘛用(一句话:给一块数据换坐标系)**:
+  角色:**A=数据物理排布(东西在哪),B=你想要的访问视角(逻辑意图),R=A∘B 把意图翻译成真实内存 offset**。
+  你不用手算地址,`R(你的坐标)` 直接给对的 offset。CuTe 文档:几乎每个高层操作都靠它。
+  三大场景(本质是同一件事,练习文件 `compuse.cpp` 全部验证过):
+  1. **切子块 / tiling**:B="取哪个子块" → R 给子块每格在**原内存**的 offset。
+     例 `(8,8):(1,8) o <4:1,4:1> = (4,4):(1,8)`,切出左上角 4×4,stride 仍是原矩阵的
+     (tile 记得自己从大矩阵切来,坐标映射回原数据)。GEMM 切 block/thread tile 即此。
+  2. **改变遍历顺序 / 重排**:B="按什么顺序走" → R 让你照常用线性坐标遍历,实际访问被重排。
+     例 `8:1 o (4,2):(2,1) = (4,2):(2,1)`,访问序变 `0 2 4 6 1 3 5 7`(先偶后奇)。
+     重排逻辑被 layout 吸收,循环代码不用改。向量化加载 / 避 bank conflict 用此。
+  3. **线程↔数据分配 (partition)**:B="哪个线程" → R 给该线程负责的数据 offset。
+     例 `16:1 o 4:4`,线程 0/1/2/3 起点 offset=0/4/8/12。`local_partition` 核心。
+     (真实 partition 用二维 tiler 同时给「线程维」和「每线程数据维」,这里是最简形式。)
+  - 共同骨架:**B 逻辑意图 + A 物理现实 → R=A∘B 翻译成地址**。切块/重排/分线程表面三件事,
+    数学上同一个 composition。所以 logical_divide/product、local_tile/partition 全是它的包装。
+  - 练习文件:`.vscode/cute-learn/compuse.cpp`。
+
+- **by-mode composition(逐模式复合)—— tiling/分块的基础**:文档 `02_layout_algebra.md:286`。
+  - **普通 composition**:第二参 B 是单个 layout,把 A **当一维函数**整体复合,不管 A 的多维结构。
+  - **by-mode**:第二参是 **Tiler**(`make_tile(t0,t1,...)` 造,记号 `<t0,t1,...>` 尖括号),
+    **对 A 的每个 mode 分别独立做 composition**,互不干扰。等价定义:
+    `composition(a, make_tile(t0,t1)) ≡ make_layout(composition(layout<0>(a),t0), composition(layout<1>(a),t1))`。
+  - **作用**:对多维 layout 的**每个维度分别施加不同的切法**(而非拍平混在一起)。
+    文档:「对列方向取一个子布局、对行方向取另一个」。
+  - **手算实例**(练习验证过):`a=(12,(4,8)):(59,(13,1)) o <3:4, 8:2>`:
+    - mode0: `12:59 o 3:2... ` → `12:59 o 3:4` = 从 12:59 每隔4取3 → `3:236`(59*4=236)。
+    - mode1: `(4,8):(13,1) o 8:2` → /2:`(2,8):(26,1)`,%8:`(2,4)` → `(2,4):(26,1)`。
+    - 合并 = `(3,(2,4)):(236,(26,1))`(与实测一致)。
+  - **记号区分**:`<A,B,...>`(尖,Tiler)=分而治之逐 mode 作用;`(A,B,...)`(圆)=sublayout 拼接。外观像,含义反。
+  - 【用途】**tiling 的台阶**:GEMM 把大矩阵 `(M,N)` 按 M 维、N 维分别切 tile 全靠它;
+    是通往 logical_divide / local_tile 的基础。普通 composition 做不到(会把 M/N 拍平)。
+
+- **complement(补)—— logical_divide/product 的前置**:文档 `02_layout_algebra.md:338`,
+  源码 `include/cute/layout.hpp:1166`(注释:"just a sort and a fold")。
+  - **是什么(两个等价视角)**:
+    - 描述视角(文档):A **没碰到的「剩余」元素**的布局。composition 里 B 从 A「选中」tile,
+      complement 描述**没被选中的那些**怎么排。
+    - **操作视角(学习者总结,做 tiling 更顺手)**:complement = **为了把 A 密集填满 size=M 的空间,
+      需要额外增加的那些 mode 的 layout**。即「A 上再拼哪些维度,才能不重不漏铺满 M」。
+    - 两者是同一事两面:「剩余的位置」正好由「额外的 mode」来编排填入。
+    - 精确化:`(A, complement(A,M))` 拼起来 **size==cosize==M 且是 [0,M) 上的双射**(即 compact,
+      不重不漏)。**前提:A 必须单射**;A 若非单射 complement 编译报错(源码 Non-injective 检查)。
+    - 印证:`complement((4,6):(1,4),24)=1:0` —— A 已铺满,不需额外 mode,故平凡 `1:0`。
+  - **三性质(保证唯一)**:① 有界:size/cosize ≤ size(M)。② 有序:stride 正且**递增**(故唯一)。
+    ③ 不相交:A 与 R 的 codomain 不重叠,R 精确填 A 没占的位置。
+  - **两种补法**:① **填洞**(A 元素间有空隙→补进去);② **重复/平铺**(A 整体没铺满 M→平铺够)。
+  - **手算算法**(排序+累积扫描):
+    1. filter A(扔 size=1/stride=0 mode)→ 各 mode 按 **stride 升序** 排。设 `current=1`。
+    2. 对每个 mode `s:d`(stride 从小到大):产出补 mode **shape=`d/current`, stride=`current`**;
+       然后更新 **`current = d*s`**。(`d/current`=当前占用点到该 stride 之间的洞大小。)
+    3. 收尾:产出最后补 mode **shape=`M/current`, stride=`current`**(=整体重复次数)。
+    4. `coalesce` 结果(扔掉 size=1 的平凡 mode)。
+    - `d/current` 和 `M/current` 必须整除,否则非法(源码 static_assert，A 非单射会报错)。
+  - **逐步手算实例 `complement((2,2):(1,6), 24) = (3,2):(2,12)`**:
+    排序后 `[2:1, 2:6]`,current=1。
+    - mode `2:1`:补 shape=1/1=1(平凡丢),current=1*2=2。
+    - mode `2:6`:补 shape=6/2=3 stride=2 →`3:2`(填 offset 2..5 的洞),current=6*2=12。
+    - 收尾:补 shape=24/12=2 stride=12 →`2:12`(整体重复2次)。
+    - coalesce → `(3,2):(2,12)`。验证:A 占{0,1,6,7},comp 占{0,2,4,12,14,16},
+      A 平铺到 comp 每点 → 恰好密铺 0..23 无重复。
+    - 其它:`4:2→(2,3):(1,8)`;`4:1→6:4`(纯重复);`6:4→4:1`(纯填洞);`(4,6):(1,4)→1:0`(已满)。
+  - **为何是 divide 前置**:`logical_divide: A⊘B := A∘(B, B*)`,`B*=complement(B, size(A))`。
+    B=tile 内部、B*=tile 之间,合起来把 A 干净切成「tile 维 + tile 间维」。
+  - 练习文件:`.vscode/cute-learn/comp2.cpp`、`comp3.cpp`。
+
+- **logical_divide(切分)—— tiling/partition 的核心**:文档 `02_layout_algebra.md:383`。
+  - **是什么**:把 layout A **切成两层:tile 内 + tile 间**。定义:`A⊘B := A∘(B, B*)`,
+    `B*=complement(B, size(A))`。B=tiler(一个 tile 内部长啥样),B*=剩余(tile 之间怎么排)。
+    `(B,B*)` = 「tile 内+tile 间」完整坐标系,再 `A∘` 映回真实内存。**没有元素被丢弃**。
+  - **结果两个 mode**:mode-0 = tile 本身(**恰等于 `A∘B` 的 composition 结果**);
+    mode-1 = 遍历各 tile(靠 complement 组织)。**divide = composition + 把剩余也组织好**。
+  - **1-D 实例**:`A=(4,2,3):(2,1,8) ⊘ B=4:2`:B*=complement(4:2,24)=(2,3):(1,8),
+    (B,B*)=(4,(2,3)):(2,(1,8)),A∘(B,B*)=`((2,2),(2,3)):((4,1),(2,8))`。
+    mode0 `(2,2):(4,1)`=tile(与 A∘B 一致);mode1 `(2,3):(2,8)`=6 个 tile 起点 0,2,8,10,16,18。
+  - **⚠️ 2-D divide 必须用 `make_tile`(Tiler,尖括号)不能用 `make_layout`(拼接)**(实测踩坑):
+    - 错:`make_layout(la, lb)` 把两子 layout 焊成一个大 layout,常**非单射** →
+      对它(或手动整体)求 complement 时编译报错 `Non-injective Layout detected in complement`。
+    - 对:`make_tile(t0,t1)` 得 Tiler,divide **对 A 每个 mode 分别做 1-D divide**(各自 complement 单射合法)。
+    - 别手动对多维 tiler 求 complement——by-mode 内部逐 mode 算,你只管 `logical_divide(A, tiler)`。
+  - **2-D 逐步拆解实例**(复杂,完整记录;练习 `divstep.cpp`):
+    `A=(9,(4,8)):(59,(13,1)) ⊘ <3:3, (2,4):(1,8)>` → 两条独立 1-D divide 再拼:
+    - **mode-0**:`9:59 ⊘ 3:3`。B*=complement(3:3,9)=`3:1`;(B,B*)=(3,3):(3,1);
+      A0∘: tile `9:59∘3:3=3:177`(59*3), rest `9:59∘3:1=3:59` → `(3,3):(177,59)`。
+    - **mode-1**:`(4,8):(13,1) ⊘ (2,4):(1,8)`。B*=complement((2,4):(1,8),32)=`4:2`;
+      tile `(2,4):(13,2)`, rest `(2,2):(26,1)` → `((2,4),(2,2)):((13,2),(26,1))`。
+    - 合并 `R=((3,3),((2,4),(2,2))):((177,59),((13,2),(26,1)))`。
+    - **读法 `((TileM,RestM),(TileN,RestN))`**:每维劈成(tile内, tile间)。
+      行9→(tile 3, 共3 tile)、列32→(tile 8, 共4 tile) ⇒ 切成 3×8 的 tile、共 3×4=12 个 tile。
+  - **四种变体**(重排 mode 方便切 tile;`Layout=(M,N,L)`,`Tiler=<TileM,TileN>`):
+    - `logical_divide`: `((TileM,RestM),(TileN,RestN),L)` 原始,tile/rest 交错。
+    - `zipped_divide`: `((TileM,TileN),(RestM,RestN,L))` **★最常用**,tile 聚一起、rest 聚一起。
+    - `tiled_divide`: `((TileM,TileN),RestM,RestN,L)`;`flat_divide`: `(TileM,TileN,RestM,RestN,L)`。
+    - zipped 让 tile 可索引:`zd(0,3)`=第3个tile起点,`zd(0,make_coord(1,2))`=第(1,2)个,
+      `layout<0>(zd)`=tile 本身布局(恒定)。
+  - 【用途】**GEMM 的心脏**:`local_tile` 底层就是 zipped_divide。大矩阵 `(M,N) ⊘ <128,128>`
+    → `((128,128),(M/128,N/128))`,mode-1 用 blockIdx 索引 → 每个线程块拿到自己那块 tile。
+  - 练习文件:`.vscode/cute-learn/divide.cpp`、`divstep.cpp`。
+
+## 待办 / 下次从这里继续
+
+已完成:00 + 01 大半(tuple 底层、部分静态、坐标机制、size/cosize、层次化 shape),
+02:compatible、crd2idx/idx2crd、coalesce、composition(含 by-mode + 用途)、complement、
+**logical_divide(含 1-D/2-D 逐步拆解 + 四种变体 + make_tile 坑,已学完)**。
+下一步:继续 **02_layout_algebra.md**:
+1. **logical_product(铺开)** ← 从这里开始(divide 的对偶:把 B 按 A 重复铺开)。
+2. 然后 zipped/tiled/flat product、local_tile/local_partition、blocked/raked product。
+3. 保持打印驱动 + 手算先行 + 原理/用途双轨。
