@@ -1,8 +1,12 @@
+// 合并归档: tuple.cpp
 #include <cute/tensor.hpp>
 #include <cstdio>
+#include <set>
+
+namespace ex_tuple {
 
 using namespace cute;
-int main()
+void run()
 {
     // 一个层次化 tuple：外层 3 个元素，其中第 1 个自己又是 tuple
     auto s = make_shape(2, make_shape(3, 4), 5);
@@ -24,4 +28,11 @@ int main()
     // take<B,E>: 切出 [B, E) 区间的子 tuple（左闭右开）
     print("take<0,2>(s)   = "); print(take<0,2>(s)); print("   <- 取前两个元素\n");
     print("take<1,3>(s)   = "); print(take<1,3>(s)); print(" <- 取后两个元素\n");
+}
+} // namespace ex_tuple
+
+int main() {
+  cute::print("\n##### tuple #####\n");
+  ex_tuple::run();
+  return 0;
 }

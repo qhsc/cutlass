@@ -1,8 +1,12 @@
+// 合并归档: coalesce.cpp, coaldyn.cpp
 #include <cute/tensor.hpp>
 #include <cstdio>
+#include <set>
+
+namespace ex_coalesce {
 
 using namespace cute;
-int main()
+void run()
 {
     // 文档例子: (2,(1,6)):(1,(6,2)) -> 12:1
     auto a = make_layout(make_shape (_2{}, make_shape (_1{},_6{})),
@@ -35,4 +39,30 @@ int main()
     auto l3 = make_layout(make_shape(2,3,4), make_stride(1,2,6));
     print("l3 = "); print(l3); print("\n");
     print("-->"); print(coalesce(l3)); print("\n");
+}
+} // namespace ex_coalesce
+
+namespace ex_coaldyn {
+
+using namespace cute;
+void run()
+{
+    // 动态 stride：运行时 int
+    auto dyn = make_layout(make_shape(2,3,4), make_stride(1,2,6));
+    print("动态 dyn = "); print(dyn); print("\n");
+    print("coalesce = "); print(coalesce(dyn)); print("   <- 合并结果?\n\n");
+
+    // 静态 stride：编译期常量
+    auto sta = make_layout(make_shape(_2{},_3{},_4{}), make_stride(_1{},_2{},_6{}));
+    print("静态 sta = "); print(sta); print("\n");
+    print("coalesce = "); print(coalesce(sta)); print("   <- 合并结果?\n");
+}
+} // namespace ex_coaldyn
+
+int main() {
+  cute::print("\n##### coalesce #####\n");
+  ex_coalesce::run();
+  cute::print("\n##### coaldyn #####\n");
+  ex_coaldyn::run();
+  return 0;
 }

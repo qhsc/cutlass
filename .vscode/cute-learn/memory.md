@@ -43,13 +43,14 @@
   - `.vscode/cute-learn/Makefile`
   - `.vscode/tasks.json`
 
-**两种编译运行方式(等价,同一条 nvcc 命令):**
+**练习文件组织(已压缩归档)**:所有示例按主题合并进 `.vscode/cute-learn/examples/` 下 7 个文件,
+编号即学习顺序:`01_layout` `02_tuple` `03_coalesce` `04_composition` `05_complement`
+`06_divide` `07_product`。每个原示例在文件内独立 namespace(`ex_xxx::run()`),末尾 main 顺序调用。
 
-- 终端:`cd .vscode/cute-learn && make run`(默认跑 layout.cpp;`make run F=algebra` 跑别的)
-- VSCode:打开某个 .cpp,按 `Ctrl+Shift+B`,自动编译+运行当前文件
-
-裸命令(备用):
-`nvcc -I include -I tools/util/include -std=c++17 -Wno-deprecated-gpu-targets 文件.cpp -o 输出 && ./输出`
+**编译运行(在 `examples/` 目录)**:
+- `make run F=06`(编号前缀简写,产物进 `build/`);`make run F=06_divide` 全名也行。
+- `make all` 编译全部;`make clean` 清 `build/`。VSCode 里打开某 .cpp 按 `Ctrl+Shift+B`。
+- ⚠️ 坑:namespace 内示例函数用 `void run()`,不能 `int main()` 无 return——否则 UB 会 SIGILL(RC=132)。
 
 ---
 
@@ -80,7 +81,7 @@
 - [x] 方向确认、路线定案、环境搭好、编译链路跑通
 - [x] 见过第一张 layout 图:`(8,4):(1,8)` = 列主序
       映射:偏移 = 行×stride[0] + 列×stride[1] = 行×1 + 列×8
-- [ ] **进行中的练习**:把 `layout.cpp` 的 stride 改成 `(4,1)`,预测图再验证(理解行主序 vs 列主序)
+- [ ] **进行中的练习**:把 `.vscode/cute-learn/examples/01_layout.cpp`。
 - [ ] 尚未正式开讲 01_layout.md 的完整内容
 
 ## 已掌握的概念(逐步累积)
@@ -121,7 +122,7 @@
     (外层 2 个元素,首元素本身是 tuple)。是 CuTe 表达分块/多级 tiling 的基础。
   - **Shape 与 Stride 本质同类型**(都是 tuple),`Shape`/`Stride` 只是语义标签;
     操作 tuple 的工具对两者通用。
-  - 练习文件:`.vscode/cute-learn/tuple.cpp`。
+  - 练习文件:`.vscode/cute-learn/examples/02_tuple.cpp`。
 
 - **部分静态 tuple(动/静态混合)的实现原理**——三块机制咬合:
   1. **`Int<4>` = `C<4>` 是空类型**(`include/cute/numeric/integral_constant.hpp`):
@@ -171,7 +172,7 @@
   - **compact(紧致)判定:`size == cosize` ⟺ 无空洞、数据紧密**。
     【用途】compact 才能整块 memcpy;开 smem buffer 按 cosize 开(否则最大偏移越界);
     空洞常是故意的(规避 bank conflict / 从大 tensor 切下的非连续 sub-tile)。
-  - 练习文件:`.vscode/cute-learn/layout.cpp`。
+  - 练习文件:`.vscode/cute-learn/examples/01_layout.cpp`。
 
 - **一维坐标 → 多维坐标怎么拆(索引的总机制)**:两步,分开看就不乱。
   1. **拆坐标**:把一维 `j` 按 shape 拆成 `(j0,j1,...)`,规则 = **像拆十进制的个位十位,
@@ -182,7 +183,7 @@
     例:shape `(2,2)` 下 j=0,1,2,3 永远拆成 (0,0)(1,0)(0,1)(1,1);
     配 stride (2,1) 得偏移 0,2,1,3(交错来自 stride),配 (1,2) 得 0,1,2,3。
   - 这也是「一维坐标能索引多维 layout」`a(9)==a(1,1)` 的原理;层次化 mode 的交错同理。
-  - 练习文件:`.vscode/cute-learn/coord.cpp`。
+  - 练习文件:`.vscode/cute-learn/examples/01_layout.cpp`。
 
 - **compatible(兼容)—— layout 代数的地基概念(一开始难懂,务必记牢)**:
   文档 `02_layout_algebra.md` / `01_layout.md:349`。
@@ -224,7 +225,7 @@
     - 正向 `crd2idx` 对以上所有情况都 OK(多坐标同 offset 正是广播/碰撞的本意)。
   - 守则:调 3-arg `idx2crd` 前确保 layout 单射(最好 compact);CuTe **不检查**,后果自负。
     实践中反向只出现在 tiling 拆循环变量这种天然 compact 场景。
-  - 练习文件:`.vscode/cute-learn/coord.cpp`、`hole.cpp`。
+  - 练习文件:`.vscode/cute-learn/examples/01_layout.cpp`。
 
 - **coalesce(合并/化简)—— layout 代数第一个工具,composition 的前置**:
   文档 `02_layout_algebra.md`。
@@ -246,7 +247,7 @@
     - 【守则】编译期固定的维度/stride 尽量用 `Int<>` 静态类型——不只为零存储([[cute-tuple]]),
       更为让 coalesce/composition 等代数能真正化简/优化。CuTe kernel 里 stride 大量静态正为此。
     - 通用原理:CuTe 代数「编译期能证明的才做,证不了一律保守」。
-  - 练习文件:`.vscode/cute-learn/coalesce.cpp`、`coaldyn.cpp`。
+  - 练习文件:`.vscode/cute-learn/examples/03_coalesce.cpp`。
 
 - **composition(复合)—— layout 代数的核心,几乎所有高层操作都靠它**:文档 `02_layout_algebra.md`。
   - **概念 = 复合函数**:`R = A o B` 定义为 `R(c) = A(B(c))`。先用 B 把坐标映射成 index,
@@ -271,12 +272,12 @@
     实测:`A=(6,2):(8,2) o 4:2` → 编译失败 `static assertion failed: Shape Divisibility Condition`
     (因 4 无法沿 `(6,2)` 前缀整齐凑出)。改成 `o 3:2` 则合法。
     → composition 不是任意两 layout 都能做,CuTe 编译期帮你挡非法组合。
-  - 练习文件:`.vscode/cute-learn/comp.cpp`。
+  - 练习文件:`.vscode/cute-learn/examples/04_composition.cpp`。
 
 - **composition 到底干嘛用(一句话:给一块数据换坐标系)**:
   角色:**A=数据物理排布(东西在哪),B=你想要的访问视角(逻辑意图),R=A∘B 把意图翻译成真实内存 offset**。
   你不用手算地址,`R(你的坐标)` 直接给对的 offset。CuTe 文档:几乎每个高层操作都靠它。
-  三大场景(本质是同一件事,练习文件 `compuse.cpp` 全部验证过):
+  三大场景(本质是同一件事,练习文件 `.vscode/cute-learn/examples/04_composition.cpp` 全部验证过):
   1. **切子块 / tiling**:B="取哪个子块" → R 给子块每格在**原内存**的 offset。
      例 `(8,8):(1,8) o <4:1,4:1> = (4,4):(1,8)`,切出左上角 4×4,stride 仍是原矩阵的
      (tile 记得自己从大矩阵切来,坐标映射回原数据)。GEMM 切 block/thread tile 即此。
@@ -288,7 +289,7 @@
      (真实 partition 用二维 tiler 同时给「线程维」和「每线程数据维」,这里是最简形式。)
   - 共同骨架:**B 逻辑意图 + A 物理现实 → R=A∘B 翻译成地址**。切块/重排/分线程表面三件事,
     数学上同一个 composition。所以 logical_divide/product、local_tile/partition 全是它的包装。
-  - 练习文件:`.vscode/cute-learn/compuse.cpp`。
+  - 练习文件:`.vscode/cute-learn/examples/04_composition.cpp`。
 
 - **by-mode composition(逐模式复合)—— tiling/分块的基础**:文档 `02_layout_algebra.md:286`。
   - **普通 composition**:第二参 B 是单个 layout,把 A **当一维函数**整体复合,不管 A 的多维结构。
@@ -336,7 +337,7 @@
     - 其它:`4:2→(2,3):(1,8)`;`4:1→6:4`(纯重复);`6:4→4:1`(纯填洞);`(4,6):(1,4)→1:0`(已满)。
   - **为何是 divide 前置**:`logical_divide: A⊘B := A∘(B, B*)`,`B*=complement(B, size(A))`。
     B=tile 内部、B*=tile 之间,合起来把 A 干净切成「tile 维 + tile 间维」。
-  - 练习文件:`.vscode/cute-learn/comp2.cpp`、`comp3.cpp`。
+  - 练习文件:`.vscode/cute-learn/examples/05_complement.cpp`。
 
 - **logical_divide(切分)—— tiling/partition 的核心**:文档 `02_layout_algebra.md:383`。
   - **是什么**:把 layout A **切成两层:tile 内 + tile 间**。定义:`A⊘B := A∘(B, B*)`,
@@ -352,7 +353,7 @@
       对它(或手动整体)求 complement 时编译报错 `Non-injective Layout detected in complement`。
     - 对:`make_tile(t0,t1)` 得 Tiler,divide **对 A 每个 mode 分别做 1-D divide**(各自 complement 单射合法)。
     - 别手动对多维 tiler 求 complement——by-mode 内部逐 mode 算,你只管 `logical_divide(A, tiler)`。
-  - **2-D 逐步拆解实例**(复杂,完整记录;练习 `divstep.cpp`):
+  - **2-D 逐步拆解实例**(复杂,完整记录;练习 `.vscode/cute-learn/examples/06_divide.cpp`。
     `A=(9,(4,8)):(59,(13,1)) ⊘ <3:3, (2,4):(1,8)>` → 两条独立 1-D divide 再拼:
     - **mode-0**:`9:59 ⊘ 3:3`。B*=complement(3:3,9)=`3:1`;(B,B*)=(3,3):(3,1);
       A0∘: tile `9:59∘3:3=3:177`(59*3), rest `9:59∘3:1=3:59` → `(3,3):(177,59)`。
@@ -369,14 +370,98 @@
       `layout<0>(zd)`=tile 本身布局(恒定)。
   - 【用途】**GEMM 的心脏**:`local_tile` 底层就是 zipped_divide。大矩阵 `(M,N) ⊘ <128,128>`
     → `((128,128),(M/128,N/128))`,mode-1 用 blockIdx 索引 → 每个线程块拿到自己那块 tile。
-  - 练习文件:`.vscode/cute-learn/divide.cpp`、`divstep.cpp`。
+  - 练习文件:`.vscode/cute-learn/examples/06_divide.cpp`。
+
+- **TileM/RestM/TileN/RestN 的含义(直观版)**:切 tile 后每个方向拆成两个数:
+  **Tile=一个瓦片内部有多大(块内)**,**Rest=这样的瓦片有几个(块间/剩余重复次数)**;
+  M/N/L 只是标"哪个方向"。例:6行×8列 切 2×4 瓦片 → 行:TileM=2,RestM=3(6/2);
+  列:TileN=4,RestN=2(8/4) ⇒ 共 3×2=6 个瓦片。Tile=放大镜(块内),Rest=地图(第几块)。
+  练习:`.vscode/cute-learn/examples/06_divide.cpp`。
+
+- **tiler 里 Layout 的 stride 决定「瓦片内部怎么采样」**:`make_tile(Layout<2,1>, Layout<4,1>)`
+  的两个 `1` 是块内 stride。**stride=1=瓦片内取连续元素**(普通紧凑块,99% 情况);
+  **stride>1=块内跳着取**(交错/采样瓦片,如 `4:2` 取第0,2,4,6列)。
+  用途:交错分配给线程(相邻线程取交错数据)以合并访存/避 bank conflict。
+  另:**tiler 的 rank 可 < layout 的 rank**——未被覆盖的维度原样保留:
+  logical 让它裸跟在后面 `((TileM,RestM),(TileN,RestN),L)`;zipped 归入 rest 组
+  `((TileM,TileN),(RestM,RestN,L))`。GEMM 只切 M/N、batch 维 L 不切即用此。
+  练习:`.vscode/cute-learn/examples/06_divide.cpp`。
+
+- **logical vs zipped 的本质(自己推出的洞察)= 同一个 divide 的不同 mode 排列**:
+  四个分量(TileM/RestM/TileN/RestN,各是 size:stride)完全相同,只是**分组/排列不同**——
+  logical 按**方向**分组 `((TileM,RestM),(TileN,RestN))`(保留 M/N 语义);
+  zipped 按**角色**分组 `((TileM,TileN),(RestM,RestN))`(把「一整个瓦片」拎成 mode-0,便于索引块)。
+  实测:同一元素两种坐标给出**相同 offset**(ld((1,1),(2,0))==zd((1,2),(1,0))==15)。
+  - **两种「变形」性质不同**(关键区分):
+    - **flatten(去括号)**:`((2,3),(4,2))`↔`(2,3,4,2)` 逐点**完全不改函数**,括号纯是显示分组。
+    - **permute(重排 mode,如 logical↔zipped)**:遍历顺序变、坐标→元素配对变,
+      但**碰到的 offset 集合(codomain)不变**。类比洗牌:牌不变(集合),抽牌顺序变。
+  - 所以「底层是同一个东西」**对集合成立,对函数(带顺序)不成立**。
+    GPU 里顺序决定一切:相邻坐标碰哪个地址 → 影响 coalescing/bank conflict;
+    copy 的第 i 个对第 i 个 → permute 改配对。故 CuTe 保留多种排列,顺序/分组是有用信息。
+  - **layout 不只是「一堆元素」,而是「带顺序、带结构的访问方式」**:去括号随便,换顺序有意义。
+  - 练习:`.vscode/cute-learn/examples/06_divide.cpp`。
+
+- **logical_product(铺开)—— divide 的对偶**:文档 `02_layout_algebra.md`。
+  - **是什么**:divide 是「把大 layout 切成 tile」,product 是「把 tile A 复制铺开成大 layout」。
+    定义:`A⊗B := (A, A*∘B)`,`A*=complement(A, size(A)*cosize(B))`。
+  - **公式逐块拆解(自己推出的理解)**:
+    - mode-0 = **A 原样保留**(product 是扩充 A,当然留着 A)。
+    - 要拼的是 A 的补 A*,但**不能直接拼 A***:A* 只是「A 能重复的**所有可用槽位**」(满格,
+      最多 cosize(B) 份);**必须先 `A*∘B`**——用 B 去 composition,即**从所有槽位里按 B 挑选并排序**
+      (B.size=要几份、B.stride=按什么顺序/间隔)。即「按 B 的方式扩充」。
+    - `(A, A*∘B)` = 瓦片 + 它的实际排布。
+  - **与 divide 的对偶对称**:
+    - divide `A⊘B = A∘(B,B*)`:B=tiler,composition 作用在**外层**(整个 A∘坐标系),选中的放外面。
+    - product `A⊗B = (A, A*∘B)`:A=tile,composition 作用在**内层**(只 A*∘B,A 原样拼上),补出来的去复合。
+  - **1-D 结果与 divide 同构**:`A=(2,2):(4,1) ⊗ B=6:1` → `((2,2),(2,3)):((4,1),(2,8))`,
+    和 1-D divide 例子结果**完全相同**。同一「tile+排布」两层结构,divide 从大切来、product 从小铺来。
+    此例 B=6:1 正好把 6 槽位全按序选中,故 `A*∘B==A*`;若 B=(4,2):(2,1) 则只选8个且换序 → 瓦片重排。
+  - **blocked_product vs raked_product**(实用形式,直接说「A 按 B 铺开」,A/B 独立直观;
+    by-mode tiler 做 product **不推荐**,因 tiler 需精确知道 A 的 shape/stride,反直觉):
+    - 两者 **rank-sensitive**:让 A、B 同 rank,product 后把同类 mode(列配列、行配行)重组。
+    - **blocked**:瓦片**成块聚集**(贴瓷砖,每块完整挨一块)。tile 2x5 铺成 3x4 → `((2,3),(5,4))`。
+      线程视角:每线程拿**连续一块** [T0 T0][T1 T1]... → 数据局部性(如寄存器分块)。blocked 会顺手 coalesce mode-0。
+    - **raked**:瓦片**交错/耙开**(cyclic 循环分布),tile 元素与排布交织。→ `((3,2),(4,5))`。
+      线程视角:线程**交错**拿 [T0 T1 T2 T3][T0 T1 T2 T3]... → 相邻线程读相邻内存 = **合并访存**(如全局内存加载)。
+    - 区别在重组顺序:blocked 列mode=A列then B列;raked 列mode=B列then A列。
+  - 【用途】GEMM/CuTe 里**把数据分配给线程**的两种经典模式:连续块=blocked,交错访存=raked。
+  - 练习:`.vscode/cute-learn/examples/07_product.cpp`。
+
+- **blocked_product 的内部计算 3 步(源码 `layout.hpp:1726`,只有 3 行)**:
+  1. **rank 对齐**:`R=max(rank(block),rank(tiler))`,`append<R>` 补齐不足的维(rank-sensitive 来源)。
+  2. **logical_product**(B 是普通 layout → by-mode),结果按角色分两大组:
+     `get<0>`=全部 tile 内(=block 本身)、`get<1>`=全部阵列。此时结构 `(所有tile内, 所有阵列)`。
+  3. **`zip(get<0>, get<1>)`**:把两组按维度**交错咬合**成 `((tile,阵列),(tile,阵列),...)`
+     (每 mode = 某方向的 (瓦片内,阵列))。
+  - **raked 唯一区别**:`zip(get<1>, get<0>)` 顺序反 → 阵列放前 → 瓦片交错而非成块。
+  - 实例:A=(2,5):(5,1), B=(3,4):(1,3) → 步1后 get0=(2,5):(5,1),get1=(3,4):(10,30);
+    blocked=`((2,3),(5,4)):((5,10),(1,30))`,raked=`((3,2),(4,5)):((10,5),(30,1))`。
+  - **tiler 方式做 product = blocked 的等价但反直觉写法**:`logical_product(A, <3:5,4:6>)` 结果
+    与 blocked 相同,但 tiler 里的 stride(5=A行stride、6=瓦片列跨度)**编码了对 A 内部结构的依赖**,
+    必须精通 A 才写得对 → 文档不推荐。实战永远用 `blocked/raked_product(tile, 阵列)`(A/B 独立)。
+
+- **★统一视角(提纲挈领,自己悟出的)——整个 layout 代数的结构**:
+  - **所有 divide/product 变体 = 两段式:核心运算 + mode 重排**。
+    core(logical_divide/logical_product 产出原始两组 mode)→ 重排(permute/zip)成方便形态。
+    源码印证:zipped_divide=重排 logical_divide;blocked_product=zip(get0,get1);raked=zip(get1,get0)。
+    变体**不产生新数据,只换 mode 排列**(呼应 flatten/permute:同数据不同排列)。
+  - **zip 本质 = 在「维度 × 角色」2×2 分组表上转置**:
+    表格 行=M/N维、列=Tile/Rest角色。**logical=按行读**(TileM,RestM 一组)、
+    **zipped=按列读**(TileM,TileN 一组)→ 正是转置(按行读↔按列读)。但只转 **mode 分组结构**,
+    不动底层数据(offset 映射/codomain 不变),是「坐标系描述」的转置,非数据转置。
+  - **全代数塌缩成一棵树**:根=**composition**(唯一真核心);两个对偶=**divide(切)/product(铺)**
+    (= composition + complement 的两种组合);其余 logical/zipped/tiled/flat、blocked/raked
+    **全是对结果的 mode 重排**。→ 记住 composition + complement + 「重排」三件事即可推导全部。
 
 ## 待办 / 下次从这里继续
 
 已完成:00 + 01 大半(tuple 底层、部分静态、坐标机制、size/cosize、层次化 shape),
 02:compatible、crd2idx/idx2crd、coalesce、composition(含 by-mode + 用途)、complement、
-**logical_divide(含 1-D/2-D 逐步拆解 + 四种变体 + make_tile 坑,已学完)**。
-下一步:继续 **02_layout_algebra.md**:
-1. **logical_product(铺开)** ← 从这里开始(divide 的对偶:把 B 按 A 重复铺开)。
-2. 然后 zipped/tiled/flat product、local_tile/local_partition、blocked/raked product。
-3. 保持打印驱动 + 手算先行 + 原理/用途双轨。
+logical_divide(1-D/2-D 拆解 + 四变体 + make_tile 坑)、
+**logical_product(含 blocked/raked,已学完)** —— 02_layout_algebra 主体基本完成。
+下一步:
+1. 收尾 02:zipped/tiled product 变体(若需);快速过一遍 `04_algorithms.md`。
+2. 进入 **03_tensor.md**:Tensor = Layout + 数据指针;local_tile / local_partition 实战。
+3. 然后 tutorial 的 sgemm(把 layout 代数用到真实 GEMM)。
+4. 保持打印驱动 + 手算先行 + 原理/用途双轨。
