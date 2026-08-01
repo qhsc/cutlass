@@ -454,14 +454,69 @@
     (= composition + complement 的两种组合);其余 logical/zipped/tiled/flat、blocked/raked
     **全是对结果的 mode 重排**。→ 记住 composition + complement + 「重排」三件事即可推导全部。
 
+- **Tensor = Engine(数据指针) + Layout(坐标→offset)**:文档 `03_tensor.md`。
+  - **本质一行**:`tensor(coord) ≡ data()[ layout()(coord) ]`。Layout 是「地图」(coord→offset),
+    Engine 是「地皮」(持有随机访问迭代器,负责 `ptr[offset]` 取真实元素)。前面 layout 的硬骨头啃完,
+    tensor 就是给 layout 配个指针。实测 `v(2,1)==A[layout(2,1)]` 完全吻合。
+  - 【用途】算法只跟 Tensor 打交道 → 同时拿到「形状/访问方式」和「数据」,且**完全不关心数据在
+    gmem/smem/rmem**——换内存空间算法代码一行不改。这是 CuTe 写泛型 kernel 的根基。
+  - **owning vs nonowning(关键区别)**:
+    - **nonowning(视图)**:`make_tensor(ptr, layout)`,像裸指针,拷贝不拷数据,layout 静态/动态都行。
+      典型 = gmem/smem 视图。函数传参要用引用/const 引用(传值可能触发深拷)。
+    - **owning(拥有)**:`make_tensor<T>(static_layout)`,像 `std::array`,拷贝深拷、析构释放,
+      **layout 必须全静态**(shape+stride 都 `Int<>`)。典型 = rmem(寄存器)。
+      **为何必须全静态**:底层是 `T arr[N]`,N 要编译期常量;CUDA kernel 里不做动态分配(非性能操作)。
+      `make_tensor_like(t)` = 造个同 value_type/shape、尽量同 stride 序的 owning rmem tensor。
+    - 【用途】`make_tensor<float>(Shape<_4,_8>{})` = 在寄存器开 4×8 临时 buffer;GEMM 每线程的累加器 C 即此。
+  - **指针 tagging(`make_gmem_ptr`/`make_smem_ptr`)**:给迭代器贴「内存空间」标签,写进 tensor 类型。
+    不贴也能跑,但贴了 CuTe 才能**编译期 dispatch 到最快 copy**(如 `cp.async`/TMA 硬性要求 src=gmem、
+    dst=smem)并**校验没接错内存**。
+  - **⚠️ 坑(实测)**:`make_tensor` 传**裸数组** `float A[64]` 会被当数组类型报错
+    (`array must be initialized with a brace-enclosed initializer`)→ 传**指针** `float* p=A; make_tensor(p,...)`。
+  - 练习:`.vscode/cute-learn/examples/08_tensor.cpp`。
+
+- **Tensor 三种访问 + slice(切子张量)**:文档 `03_tensor.md`。
+  - **访问**:`t(变参坐标)` / `t[make_coord(...)]` / `t[i]`(线性,按 layout 顺序遍历)三者等价通向同一元素。
+  - **slice = 用 `_`(Underscore,= Matlab 的 `:`)抽子张量**,做两件事:
+    ① 给了**具体坐标**的维求值,offset 累加进指针 → 新指针指向子张量起点;
+    ② 给了 `_` 的维**保留其 layout** → 组成新 layout。**结果 rank == 坐标里 `_` 的个数**。
+  - **⚠️ 易混:`_` vs `make_coord(_,_)` 决定 rank**(实测):对层次维 `(_3,2)`,
+    `T(_,5)`→`((_3,2))`(单个 `_`,整个子维当一个 mode,rank1);
+    `T(make_coord(_,_),5)`→`(_3,2)`(两个 `_` 分别保留,rank2)。**元素相同、指针地址相同,但 rank/shape 不同**。
+  - 【用途】`gmem(_, j)`=取第 j 列一整列;`copy(gmem(_,j), rmem)`=把一列搬进寄存器。切某行/列/tile 的通用手段。
+
+- **Partition(划分)= tiling(zipped_divide)+ slice —— GEMM 命脉**:文档 `03_tensor.md`。
+  - 先 `tiled = zipped_divide(T, tiler)` → `((tile内),(tile编号))`,再按方向 slice:
+    | | 切法 | 保留 | 语义 | 别名 |
+    |---|---|---|---|---|
+    | **inner** | `tiled(make_coord(_,_), coord)` | tile 内容 | 「给我第(bx,by)块整块」粗粒度→CTA | `local_tile` |
+    | **outer** | `tiled(idx, make_coord(_,_))` | rest 编号 | 「给每线程它在各 tile 的落点」细粒度→thread | `local_partition` |
+  - **为何方向相反**:inner 保 tile 内容、遍历 tile 编号(分给 block);outer 固定线程、遍历它在各 tile 的落点(分给 thread)。
+  - 实测:`tiled(mc(_,_),(1,2))` 与 `local_tile(T,tiler,(1,2))` **地址完全相同** → 证实 local_tile = inner_partition 别名。
+    inner 块起点 offset 用 zipped 后 mode 的 stride 算(`1*4+2*64=132`)与实测指针偏移吻合。
+  - `local_partition(T, Layout, Idx)` = rank-sensitive 的 outer 包装:用 Layout 的逆把 Idx 转成 Coord,
+    再按 Layout 顶层 shape 造 Tiler → 可指定行主/列主/任意的线程排布来划分。
+  - **两级划分**:GEMM 先 `local_tile` 把大矩阵分给 CTA,再 `local_partition` 把 tile 分给线程。
+  - **TV-partition(thread-value)**:造一个 TV-layout 把 (线程id, 值id)→目标数据坐标,`composition(A, tv_layout)`
+    变形后 slice 线程维 → 每线程拿到它那几个值(按 TV 规定的形状/顺序)。MMA 里线程拿寄存器片段用此。
+  - 练习:`.vscode/cute-learn/examples/08_tensor.cpp`。
+
+- **⚠️ 设计约束:Tensor 只能 divide,不能 product**:文档 `03_tensor.md`。
+  - `composition / logical_divide / zipped_divide / tiled_divide / flat_divide` 对 Tensor 开放,
+    但 `_product` **不开放**。原因:product 会**扩大 codomain**(值域范围变大)→ tensor 要访问远超原
+    边界的内存,危险。divide=「在已有数据里切分」(安全);product=「凭空造更大布局」(只对纯 Layout 有意义)。
+
 ## 待办 / 下次从这里继续
 
 已完成:00 + 01 大半(tuple 底层、部分静态、坐标机制、size/cosize、层次化 shape),
 02:compatible、crd2idx/idx2crd、coalesce、composition(含 by-mode + 用途)、complement、
-logical_divide(1-D/2-D 拆解 + 四变体 + make_tile 坑)、
-**logical_product(含 blocked/raked,已学完)** —— 02_layout_algebra 主体基本完成。
+logical_divide(1-D/2-D 拆解 + 四变体 + make_tile 坑)、logical_product(含 blocked/raked)
+—— 02_layout_algebra 主体完成。
+**03_tensor.md 已学完**:Tensor=Engine+Layout、owning/nonowning、tagging、三种访问、slice(`_` 规则)、
+partition(inner/outer=local_tile/local_partition、TV-partition)、Tensor 只 divide 不 product。
+练习 `08_tensor.cpp` 全部验证过(RC=0)。
 下一步:
-1. 收尾 02:zipped/tiled product 变体(若需);快速过一遍 `04_algorithms.md`。
-2. 进入 **03_tensor.md**:Tensor = Layout + 数据指针;local_tile / local_partition 实战。
-3. 然后 tutorial 的 sgemm(把 layout 代数用到真实 GEMM)。
+1. 快速过一遍 `04_algorithms.md`(copy / gemm / axpby 等 tensor 上的算法)。
+2. 然后 tutorial 的 sgemm(`examples/cute/tutorial/sgemm_1.cu`→`sgemm_2.cu`,把 layout 代数用到真实 GEMM)。
+3. 之后按需:MMA(`0t_mma_atom.md`)/ TMA / predication。
 4. 保持打印驱动 + 手算先行 + 原理/用途双轨。
