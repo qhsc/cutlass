@@ -717,6 +717,46 @@
     - 这与“累加器从寄存器迁到 tmem”处于同一演进链路：Blackwell 系统性地将大块矩阵数据从寄存器迁移到 tmem。
     - 源码：SM90 `mma_sm90_gmma.hpp`（SS:13613，RS:13672）；SM100 `mma_sm100_umma.hpp`（SS:1214，TS:1292）。
 
+### MMA Traits 层:ThrID / ABC Layout(进行中)
+
+- **Traits 层的使命(一句话)**:把硬件强制规定的「线程↔数据」别扭分布,**转录成一个 CuTe layout 的 shape+stride**。一旦变 layout,别扭分布就成了可组合/可计算的数学对象——这是 CuTe 驯服 tensor core 的全部秘密。三主角:`ThrID`(逻辑线程号→warp 物理 idx)、`CLayout`(逻辑(tid,vid)→C 的 (m,n))、`ALayout/BLayout`(→A 的 (m,k)/B 的 (n,k))。
+
+- **★ThrID 的方向 + 输入域(最易绕晕,亲历踩坑)**:以 Volta HMMA 8x8x4 为例,`ThrID = Layout<Shape<_4,_2>,Stride<_1,_16>>`。
+  - **输入域永远是连续 [0,8)**(逻辑线程号),size=8。散的集合 `{0,1,2,3,16,17,18,19}` 是它的**输出(range)不是输入**。拆坐标只看 shape(4,2):逻辑 0~3→(0..3,0)→物理 0~3;逻辑 4~7→(0..3,1)、第二维 stride=16→物理 16~19。**「散」是 stride 造出来的,输入本身不散**(呼应早学的「拆分只依赖 shape,乱序来自 stride」)。
+  - 想要反方向 `物理 idx→逻辑号`(以散集合为输入域)= `right_inverse(ThrID)`;ThrID 单射故有逆。kernel 里线程手上是 `threadIdx`(物理号),要反查逻辑号才用逆。**存进 Traits 的永远是正方向**(输入连续、shape/stride 干净好组合)。
+  - **为何需要 ThrID**:CLayout 用的是**逻辑线程号**(连续 0~7),硬件用物理号(不连续),ThrID 是二者的桥。但注意:**ThrID 和 CLayout 各自独立、互不调用**——CLayout 处理逻辑 4~7 时不查 ThrID 的 16~19,它用自己的 stride 直接算。两套「别扭」分开编码:物理号的别扭只活在 ThrID,数据位置的别扭只活在 CLayout 的 stride。
+
+- **★一个 atom 只管 8 个线程,32 个线程由 TiledMMA 铺(关键认知)**:一个 HMMA 8x8x4 atom 天生只需一个 quadpair(8 线程=QP0=`{0,1,2,3,16,17,18,19}`)。warp 的另外 24 线程属于 QP1/2/3,**不由 ThrID/Traits 管**。`make_tiled_mma` 把这一个 atom 的模式**复制 4 份**盖满整个 warp(拼成 16x16x4,四象限各一个 QP,复制遵循 `(2,2):(2,1)` 的 atom 排布)。**ThrID/CLayout 只描述单个 atom 内部的最小单元;铺满 warp / 更大 tile 是上层 TiledMMA 的事**。
+  - warp 拆 QP:QP0`{0-3,16-19}` QP1`{4-7,20-23}` QP2`{8-11,24-27}` QP3`{12-15,28-31}`。
+
+- **★CLayout/ThrID 的输入都是逻辑线程号,使用时「物理→逻辑」自动转(源码印证)**:CLayout 的输入是逻辑 tid 0~7,**不是物理 `threadIdx`**。真实调用链:`物理 threadIdx --right_inverse(ThrID)--> 逻辑 tid --CLayout--> (m,n)`。源码 `include/cute/atom/mma_atom.hpp:405` 有个变量就叫 `thridx_2_thrid`(= `composition(..., right_inverse(...))`),`get_layoutC_TV()` 里 `thrfrg_C(ref_C).compose(thridx_2_thrid, _)` 把这步接上。
+  - **但代码上你不手写这步转换**:GEMM kernel 里只写 `auto thr_mma = tiled_mma.get_slice(threadIdx.x); auto tCgC = thr_mma.partition_C(gC);`。`get_slice(threadIdx.x)`(mma_atom.hpp:359)收**物理号**,内部 `get_flat_coord` + `thridx_2_thrid` 自动走完「物理→逻辑→(m,n)」,直接吐给你「本线程负责 C 的哪几个元素」。转换被 CuTe 封装,对你透明。
+  - 分层记:**Traits 层(CLayout/ThrID)= 纯逻辑蓝图**(输入输出全逻辑量);**使用层(get_slice/partition_C)= 入口收物理 threadIdx,CuTe 用 right_inverse(ThrID) 自动翻逻辑**。你只管传 `threadIdx.x`。
+
+- **★A/B Layout 与转置后缀(TN/NT/NN/TT)—— 本质:改的是 thread→data 的 ownership**:
+  - **逻辑形状恒定**:A 永远 (M,K)、B 永远 (N,K)(gemm 铁律「K 永远最右」)。转置后缀**只改 ALayout/BLayout(哪个线程持有哪个元素),不碰逻辑形状,更不碰 C**(源码 `mma_traits_sm70.hpp`:四种转置 CLayout 全是 `SM70_8x8_32b`,只 A/B 在 `_Row`/`_Col` 切换;第一字母管 A、第二字母管 B)。
+  - **ownership 是硬件 PTX 指令写死的,CuTe 只「照文档图如实转录」成 layout,不推导**。TN/NT 是两条不同指令,排布本就不同——**没有一条规则能推所有转置**(「谁连续沿谁铺」只在 TN 恰好成立,NT 硬套就错)。要写 ALayout/BLayout 就照图抄。
+  - **★求 ALayout/BLayout 的正确定义(学习者纠正,务必按这个理解,别用「沿哪轴」的结果论)**:
+    - **编码固定、与转置无关**:A 的 (m,k)→`m+k*M`、B 的 (n,k)→`n+k*N`(列主编码)。四种转置都用它。
+    - **转置只改硬件图给的 ownership** `(T,V)→(m,k)`。
+    - **求 layout = 找一个 layout 使 `layout(T,V)` 恰好等于「(T,V) 拥有的那个 (m,k)」按上式编码出的一维 idx**。即 `ALayout = ownership映射(T,V)→(m,k) ∘ 固定编码(m,k)→m+k*M`。验证=逐 `(tid,vid)` 求值对照编码 idx(文档结尾那句)。
+    - TN 抄出恰好 `(8,4):(1,8)`、NT 恰好 `((4,2),4):((8,4),1)`,同一定义、只因 ownership 图不同而不同。**「值沿 K/M、线程沿 M/K」只是观察到的结果,不是定义,且 NT 线程维是 `(4,2)`(T0-3 沿 K、T4 跳回 m=4),不能简单说「沿 K」**。
+  - 命名层(仅解释内存 major 动机,**别拿来推 ownership**):T/N 相对自然形状 A=[M,K]、B=[K,N](B 是 KN!)转不转;TN=双 K 连续=硬件规范形/文档「简单基准」。
+
+- **★为什么叫「TN」+ 为什么它是规范形(命名动机,人类易读版)**:
+  - **T/N 来自 BLAS**(几十年的 gemm 标准):N=No-transpose(不转)、T=Transpose(转)。两字母第一个说 A、第二个说 B,所以 TN = 「A 转、B 不转」。
+  - **转不转相对「自然形状 + 列主序」**:A[M,K] 列主→M 连续,转了→K 连续;B[K,N] 列主→K 连续,不转→仍 K 连续。**故 TN = A、B 双双 K 连续**。
+  - **为什么硬件偏爱 TN**:K 是收缩维(`C=Σ_k A·B`),每线程沿 K 乘加。K 连续→线程要的那几个值在内存连成一条,一次向量化 load 喂给 tensor core 最顺。所以「双 K 连续」被做成主/优化路径,恰好对应 BLAS 的 TN,文档也拿它当简单基准。
+  - **小坑**:PTX 里 CuTe 的 `_TN` 写成 `.row.col.`(逻辑名 vs 物理名:A 转置≡A 从列主变行主)。同一件事两种叫法,能对上号即可,记 CuTe 那套 T/N 为主。
+
+- **CLayout 手算(Volta HMMA 8x8x4,F32 累加器)**:`(T8,V8)→(m,n)`,(m,n) 用列主序编码成一维 index `m+n*M`(M=8)。8 线程各持 8 值 → shape 两 mode 都是 8,但**单一 stride 描述不了跳跃序列,须把 8 层次化拆成 (2,2,2) 每子维一个 stride**。
+  - 线程维(固定 V0,走 T0→T7,编码值 0,1,16,17,4,5,20,21):T0→T1=+1、T0→T2=+16、T0→T4=+4 → `Shape<_2,_2,_2>,Stride<_1,_16,_4>`。
+  - 值维(固定 T0,走 V0→V7,编码值 0,8,2,10,32,40,34,42):V0→V1=+8、V0→V2=+2、V0→V4=+32 → `Shape<_2,_2,_2>,Stride<_8,_2,_32>`。
+  - 合体 `CLayout = Layout<Shape<Shape<_2,_2,_2>,Shape<_2,_2,_2>>, Stride<Stride<_1,_16,_4>,Stride<_8,_2,_32>>>`。求值:给 (tid,vid),各自拆 (2,2,2) 坐标点积求和得编码,反解 m+8n。
+  - **F16 累加器则简单得多**:每行 (m,:) 由单线程持有 → `CLayout=Layout<Shape<_8,_8>,Stride<_1,_8>>`。
+  - 【用途】回答「第 T 号线程持的第 V 个值落在 C 矩阵哪个 (m,n)」,是造 fragment、拼 TiledMMA、GEMM 分区的地基。
+  - 练习文件:`.vscode/cute-learn/examples/10_mma_traits.cpp`(host print,RC=0)。三块:ThrID(输入连续 0..7→输出散 0-3,16-19)、CLayout(逐 T/V 求值反解 (m,n),对上文档表)、A/B TN vs NT(逐线程打印 ownership:TN 每线程一条 K 线、NT 每线程一段 M 且 T4 跳 m=4)。全部与手算/文档吻合。
+
 ## 待办 / 下次从这里继续
 
 已完成:00 + 01 大半(tuple 底层、部分静态、坐标机制、size/cosize、层次化 shape),
@@ -733,13 +773,15 @@ TFLOP/s。
 
 **进行中:0t_mma_atom.md(按文档编号顺序学 MMA,用户要求)**。已学:四层抽象框架(Operation/Traits/Atom/
 TiledMMA)、CLayout/ALayout/BLayout 灵魂概念、Operation 层详解 + SM90 vs
-SM100 对比(FP8 例)。 **约定:后续 MMA 学习都做 SM90 vs
+SM100 对比(FP8 例)。**★Volta 一节全部学完 + print 验证过(练习 `10_mma_traits.cpp` RC=0)**:ThrID(方向/输入域连续 0-7 输出散 / 与 CLayout 独立 / 物理→逻辑用 right_inverse 且被 get_slice 封装)、atom 只管 8 线程 TiledMMA 铺满 32、CLayout 手算(Volta 8x8x4 F32/F16)、A/B Layout(TN vs NT = 改 thread→data ownership、求 layout 的正确定义=ownership∘固定编码、命名来自 BLAS + 双 K 连续动机)——详见上「MMA Traits 层」小节各条。 **约定:后续 MMA 学习都做 SM90 vs
 SM100 对比(用户明确要求)。** 下一步:
 
-1. **继续 0t_mma_atom.md:Traits 层**——ThrID /
-   CLayout/ALayout/BLayout 怎么把线程↔数据映射编码成 layout (0t 文档 Volta HMMA
-   8x8x4 的手算 stride 推导是最佳教材)。仍做 SM90 vs SM100 对比。
-2. 然后 TiledMMA(make_tiled_mma 拼 atom)。
+1. **下一站:0t_mma_atom.md 的 Hopper 一节(文档 355-434 行)**。Volta 的规模升级,同学三样但形态变化大,和 Volta 正好对比:
+   - **ThrID 变简单**:`Layout<_128,_1>`(128 线程=warpgroup=4 warp,连续无跳跃,对比 Volta 的 quadpair 跳跃)。
+   - **CLayout 变复杂**:引入 "core matrix" 概念,分层 tiling 累加器(64x8 基元 → 沿 M/N 平铺)。手算目标 `SM90_64x128x16` 的 `((_4,_8,_4),(_2,_2,_16)):((_128,_1,_16),(_64,_8,_512))`。文档 367-422 行逐步推导是教材。
+   - **A/B 反直觉**:GMMA 直接从 smem 吃整块 A/B(不按线程分),`ALayout=Layout<Shape<_128,Shape<_64,_16>>,Stride<_0,Stride<_1,_64>>>` —— 所有线程都映到 (0,0)、stride=0 是**广播**(呼应早学的 stride=0 广播)。文档 424-434 行。
+   - Hopper=SM90,天然衔接 SM90 vs SM100 对比。
+2. 然后 TiledMMA(make_tiled_mma 拼 atom:1x1→2x2 铺满 warp→32x32 扩值→M-mode permute)。文档 436-509 行。接上「32 线程怎么来的」。
 3. 再进 `0x_gemm_tutorial.md` +
    `sgemm_1.cu`(把 MMA/layout/partition/copy/gemm 全串进真实 GEMM)。sgemm_1 用默认 FMA;骨架吃透后把 gemm 换成 MMA_Atom。然后 sgemm_2(pipeline)。
 4. 之后按需:TMA(`0z_tma_tensors.md`)/ predication(`0y_predication.md`)。
