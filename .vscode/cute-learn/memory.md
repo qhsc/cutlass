@@ -757,6 +757,40 @@
   - 【用途】回答「第 T 号线程持的第 V 个值落在 C 矩阵哪个 (m,n)」,是造 fragment、拼 TiledMMA、GEMM 分区的地基。
   - 练习文件:`.vscode/cute-learn/examples/10_mma_traits.cpp`(host print,RC=0)。三块:ThrID(输入连续 0..7→输出散 0-3,16-19)、CLayout(逐 T/V 求值反解 (m,n),对上文档表)、A/B TN vs NT(逐线程打印 ownership:TN 每线程一条 K 线、NT 每线程一段 M 且 T4 跳 m=4)。全部与手算/文档吻合。
 
+### MMA:TiledMMA(把 atom 铺成大 tile)
+
+- **TiledMMA = 对 atom 做 product**(呼应统一视角:product 铺开)。`make_tiled_mma(Atom, AtomLayoutMNK, PermutationMNK)` 三参:
+  - **① Atom**:用哪条硬件指令(最小单元,如 Volta 8 线程/8x8x4)。
+  - **② AtomLayoutMNK**(rank-3,对应 M/N/K):atom 沿 MNK 各**复制几份、线程怎么编号**。**加 atom = 加线程**。
+  - **③ PermutationMNK**(默认 `Tile<_,_,_>` 不排):atom 铺开后同线程数据在某维不连续,用它 scatter 重排成连续(方便设计 smem/寄存器)。**撑大 tile = 加值(每线程多拿),不加线程**。
+- **★核心:内部就是 `tiled_product(AtomThrID, AtomLayoutMNK)` → `ThrLayoutVMNK`(4维 V,M,N,K)**(源码 `mma_atom.hpp:225,231`)。
+  - 公式链:`tiled_product` = `logical_product` 再 mode 拆包重排;`logical_product(A,B) = (A, complement(A)∘B)`(A 原样 + 补集按 B 铺开)。
+  - **散线程能拼成连续的原理**:Volta atom 8 线程 `{0-3,16-19}`(缺 4-15,20-31),**`complement(atom,32)` 算出空缺布局**,`∘B` 把 3 份拷贝按偏移 +4/+8/+12 填进去 → 不重不漏铺满 0-31。那些 stride 不是手算的,是 complement 算的。Volta ThrID 设计成「隔一半」的散布正是为可平铺性。
+  - `ThrLayoutVMNK` 四维:V=atom 内线程、M/N=沿 M/N 复制的 atom、K=沿 K。是「物理线程→(哪个 atom,atom 内几号)」的地图,`get_slice(threadIdx)` 靠它分数据(上一轮 `thridx_2_thrid` 的 right_inverse 就在它上面做)。
+- **★A/B/C TV-layout 怎么随 TiledMMA 扩展(`thrfrg_C/A/B`,源码 `mma_atom.hpp:252`)**:ThrLayoutVMNK 只管线程铺开;A/B/C 的完整分区是另一条流水线,**核心=复用单 atom 的 CLayout/ALayout/BLayout(「砖」),外面套 divide 铺满整个 tile(「按图纸铺砖」)**。以 C 为例,输入整块 C layout `(M,N)`,4 步:
+  1. **Permutation 重排**:`logical_divide(C, <permM,permN>)`——参数③ 起作用处,默认恒等。
+  2. **按 atom 尺寸切块**:`zipped_divide(., <AtomM,AtomN>)` → `((AtomM,AtomN),(RestM,RestN))`,把大 tile 分解成「一个 atom 块 + 块排布」。
+  3. **★(m,n)→(thr,val)**:`.compose(AtomLayoutC_TV, _)` → `((ThrV,FrgV),(RestM,RestN))`。**单 atom 的 CLayout 在此被复用**,把块内 (m,n) 翻译成 (线程,值)。
+  4. **块排布归线程维**:`zipped_divide(., <_,<ThrM,ThrN>>)` → `((ThrV,(ThrM,ThrN)),(FrgV,(RestM,RestN)))`。因 RestM/RestN 个 atom = 不同线程组,故从值维挪到线程维。
+  - 产物结构 `((ThrV,(ThrM,ThrN)),(FrgV,(RestM,RestN)))`:线程部分=atom 内线程×沿MN复制的atom=完整线程编址;值部分 FrgV=atom 内每线程值、(RestM,RestN)=参数③撑大 tile 时每线程多拿的值。再套 `thridx_2_thrid`(right_inverse)得最终 `(物理thr,val)→(m,n)`。
+  - A/B 同构:C 用 (M,N)+CLayout;A 用 (M,K)+ALayout(取 VMNK 的 `<1>`M `<3>`K,A 不沿 N 分);B 用 (N,K)+BLayout。
+- **实测印证(练习 `11_tiled_mma.cpp` RC=0)**:
+  - `tiled_product((4,2):(1,16), (2,2):(2,1))` = `((4,2),2,2):((1,16),8,4)`,求值得 0-31 全出现,四象限偏移 +0/+4/+8/+12。`complement(atom,32)=4:4`。
+  - 1x1x1→8线程 VMNK `((4,2),1,1,1):(...,0,0,0)`;2x2x1→32线程 `((4,2),2,2,1):((1,16),4,8,0)`;**2x2 + `Tile<32,32,4>` 的 VMNK 与 2x2 完全相同**→证实「加值不改 VMNK」。
+  - C partition:线程 0/4/8/12 落 16x16 的四象限(+0/+8m/+8n/+8m8n),印证 2x2 atom 铺满 C。线程0 的 8 个 (m,n) 与单 atom CLayout 手算一致。
+
+### MMA Traits:Hopper GMMA + SM70/90/100 演进
+
+- **Hopper GMMA vs Volta HMMA(规模巨变)**:协作单位 8 线程(quadpair)→ **128 线程(warpgroup=4 warp)**;形状 8x8x4 → **64xNx16**;同步 → **异步 `wgmma.mma_async`**;A/B 来源寄存器 → **直接吃 smem 整块**。
+- **ThrID = `Layout<_128>`**:128 连续线程,逻辑号=物理号,无 Volta 的 quadpair 跳跃(Volta 用 stride=16 是因 QP 是 warp 子集)。
+- **CLayout(core matrix 分层搭建,方法同 Volta:观察硬件图→每个重复方向加一个 (子shape:子stride))**:从 8x8 core matrix 起,沿 M 堆 8 次、下一 core matrix 回 T0V2、4 warp 沿 M 重复 → 64x8 基元;64xN 再沿 N 铺 N/8 次。`SM90_64x128` = `((_4,_8,_4),(_2,_2,_16)):((_128,_1,_16),(_64,_8,_512))`(源码 `mma_traits_sm90_gmma.hpp:434`)。记方法别记数字。
+- **★A/B Layout = stride=0 广播(最大哲学转变)**:`ABLayout<M,K> = (_128,(M,K)):(_0,(_1,M))`(源码:465)。**线程维 stride=0 → 128 线程全映到 (0,0)**。因 GMMA 描述符建在整块 smem tile 上,每线程看到整块、硬件自己去 smem 取,不按线程切。Volta ALayout=线程↔数据精细分配;Hopper=整块 smem 描述+线程维广播(呼应早学的 stride=0 广播)。
+- **★SM70→90→100 演进主线:MMA「线程参与度」8→128→1**:
+  - ThrID:`(4,2):(1,16)` → `_128` → **`_1`**(SM100 单线程 elect 驱动整个 CTA)。
+  - A/B 来源:寄存器精细切 → smem 整块(线程维 stride=0 广播)→ tmem/smem(**连线程维都塌成 shape=1**)。
+  - CLayout:层次化 → core-matrix 更复杂 → **平凡 `(_1,(M,N))`**(源码 `mma_traits_sm100.hpp:180`)。
+  - 本质:线程不再参与数据切分(累加器搬进 tmem 由硬件管)→ traits 从「精细描述线程分布」退化到「根本不用描述」。与 Operation 层演进(累加器 寄存器→tmem、发射 128线程→单线程 elect)同源,这是它在 Traits 层的镜像。
+
 ## 待办 / 下次从这里继续
 
 已完成:00 + 01 大半(tuple 底层、部分静态、坐标机制、size/cosize、层次化 shape),
@@ -776,12 +810,8 @@ TiledMMA)、CLayout/ALayout/BLayout 灵魂概念、Operation 层详解 + SM90 vs
 SM100 对比(FP8 例)。**★Volta 一节全部学完 + print 验证过(练习 `10_mma_traits.cpp` RC=0)**:ThrID(方向/输入域连续 0-7 输出散 / 与 CLayout 独立 / 物理→逻辑用 right_inverse 且被 get_slice 封装)、atom 只管 8 线程 TiledMMA 铺满 32、CLayout 手算(Volta 8x8x4 F32/F16)、A/B Layout(TN vs NT = 改 thread→data ownership、求 layout 的正确定义=ownership∘固定编码、命名来自 BLAS + 双 K 连续动机)——详见上「MMA Traits 层」小节各条。 **约定:后续 MMA 学习都做 SM90 vs
 SM100 对比(用户明确要求)。** 下一步:
 
-1. **下一站:0t_mma_atom.md 的 Hopper 一节(文档 355-434 行)**。Volta 的规模升级,同学三样但形态变化大,和 Volta 正好对比:
-   - **ThrID 变简单**:`Layout<_128,_1>`(128 线程=warpgroup=4 warp,连续无跳跃,对比 Volta 的 quadpair 跳跃)。
-   - **CLayout 变复杂**:引入 "core matrix" 概念,分层 tiling 累加器(64x8 基元 → 沿 M/N 平铺)。手算目标 `SM90_64x128x16` 的 `((_4,_8,_4),(_2,_2,_16)):((_128,_1,_16),(_64,_8,_512))`。文档 367-422 行逐步推导是教材。
-   - **A/B 反直觉**:GMMA 直接从 smem 吃整块 A/B(不按线程分),`ALayout=Layout<Shape<_128,Shape<_64,_16>>,Stride<_0,Stride<_1,_64>>>` —— 所有线程都映到 (0,0)、stride=0 是**广播**(呼应早学的 stride=0 广播)。文档 424-434 行。
-   - Hopper=SM90,天然衔接 SM90 vs SM100 对比。
-2. 然后 TiledMMA(make_tiled_mma 拼 atom:1x1→2x2 铺满 warp→32x32 扩值→M-mode permute)。文档 436-509 行。接上「32 线程怎么来的」。
+1. **下一站:TiledMMA(0t_mma_atom.md 文档 436-509 行)**。make_tiled_mma 拼 atom:1x1(单 atom)→ 2x2 铺满 warp(16x16x4,复制到 T4/T8/T12,遵循 (2,2):(2,1))→ 32x32 沿值扩(复制到 T0V8 等)→ M-mode permute(用 `(4,4,2):(1,8,4)` 做 scatter 让 m 坐标连续)。接上「32 线程怎么来的」。用 `print_latex(mma)` 可视化。
+   - **Hopper GMMA 已学完**(见上「Hopper GMMA」小节):ThrID=`_128`、CLayout core-matrix 分层、A/B stride=0 广播、SM70→90→100 线程参与度 8→128→1 主线。
 3. 再进 `0x_gemm_tutorial.md` +
    `sgemm_1.cu`(把 MMA/layout/partition/copy/gemm 全串进真实 GEMM)。sgemm_1 用默认 FMA;骨架吃透后把 gemm 换成 MMA_Atom。然后 sgemm_2(pipeline)。
 4. 之后按需:TMA(`0z_tma_tensors.md`)/ predication(`0y_predication.md`)。
