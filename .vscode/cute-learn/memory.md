@@ -450,8 +450,8 @@
     - `logical_divide`: `((TileM,RestM),(TileN,RestN),L)` 原始,tile/rest 交错。
     - `zipped_divide`: `((TileM,TileN),(RestM,RestN,L))`
       **★最常用**,tile 聚一起、rest 聚一起。
-    - `tiled_divide`: `((TileM,TileN),RestM,RestN,L)`;`flat_divide`:
-      `(TileM,TileN,RestM,RestN,L)`。
+    - `tiled_divide`: `((TileM,TileN),RestM,RestN,L)`。
+    - `flat_divide`: `(TileM,TileN,RestM,RestN,L)`。
     - zipped 让 tile 可索引:`zd(0,3)`=第3个tile起点,`zd(0,make_coord(1,2))`=第(1,2)个,
       `layout<0>(zd)`=tile 本身布局(恒定)。
   - 【用途】**GEMM 的心脏**:`local_tile` 底层就是 zipped_divide。大矩阵
@@ -521,6 +521,15 @@
     - 区别在重组顺序:blocked 列mode=A列then B列;raked 列mode=B列then A列。
   - 【用途】GEMM/CuTe 里**把数据分配给线程**的两种经典模式:连续块=blocked,交错访存=raked。
   - 练习:`.vscode/cute-learn/examples/07_product.cpp`。
+
+- **product 四变体(与 divide 四变体对偶;源码 `layout.hpp`)。★大坑:这张表只在「尖括号 Tiler(by-mode)」下成立!** 设 block=(M,N,L,...)、Tiler=`<TileM,TileN>`(尖括号):
+  - `logical_product` → `((M,TileM),(N,TileN),L,...)`(逐方向交错)
+  - `zipped_product`  → `((M,N),(TileM,TileN,L,...))`(★最常用,M/N 聚一起、Tile 聚一起)
+  - `tiled_product`   → `((M,N),TileM,TileN,L,...)`(zipped 拆第二组)
+  - `flat_product`    → `(M,N,TileM,TileN,L,...)`(两组都拆平)
+  - **为何要尖括号**:by-mode Tiler 对 A 的**每个 mode 分别** product,才产生 `((M,TileM),(N,TileN))` 的逐方向交错。**若 B 是单个 layout**(非 Tiler),product 把 A/B 各当**一整块** → `logical=((整个A),(整个B))`(如 `(2,2)⊗(3,4)=((2,2),(3,4))`),**不逐方向配对,对不上此表**;且此时 `zipped==logical`(tile_unzip 对单块无事可做)。实测见 `07_product.cpp`(ex_prodtable 尖括号复现表 / ex_prodtiler 单块对比)。
+  - 关系同 divide:zipped=logical 重排;tiled=zipped 拆第二 mode;flat=拆两组(源码 `flat_product`)。**TiledMMA 用的正是 `tiled_product(AtomThrID, AtomLayoutMNK)`**,产物 `((原atom),复制M,复制N,复制K)` 便于摊平索引复制维。
+  - **注意与 blocked/raked 的区别**:那张 `((M,TileM),(N,TileN))` 逐方向配对,blocked/raked 也有类似形状——但 blocked/raked 用 `zip`(进组咬合,**改 stride/改数据排布**、rank-sensitive、A/B 独立友好),四变体用 `tile_unzip`/拆包(**不改 stride,只换括号**)。同源(都 logical_product 打底)但粒度不同,是并列兄弟非特例。
 
 - **blocked_product 的内部计算 3 步(源码 `layout.hpp:1726`,只有 3 行)**:
   1. **rank 对齐**:`R=max(rank(block),rank(tiler))`,`append<R>`
@@ -774,6 +783,7 @@
   4. **块排布归线程维**:`zipped_divide(., <_,<ThrM,ThrN>>)` → `((ThrV,(ThrM,ThrN)),(FrgV,(RestM,RestN)))`。因 RestM/RestN 个 atom = 不同线程组,故从值维挪到线程维。
   - 产物结构 `((ThrV,(ThrM,ThrN)),(FrgV,(RestM,RestN)))`:线程部分=atom 内线程×沿MN复制的atom=完整线程编址;值部分 FrgV=atom 内每线程值、(RestM,RestN)=参数③撑大 tile 时每线程多拿的值。再套 `thridx_2_thrid`(right_inverse)得最终 `(物理thr,val)→(m,n)`。
   - A/B 同构:C 用 (M,N)+CLayout;A 用 (M,K)+ALayout(取 VMNK 的 `<1>`M `<3>`K,A 不沿 N 分);B 用 (N,K)+BLayout。
+  - **实测变形链(练习 `11_tiled_mma.cpp` ex_thrfrg,2x2 TiledMMA,C=(16,16))**:`(16,16)` →Step2 `((8,8),(2,2))`(切 atom 块+块排布)→Step3 `(((2,2,2),(2,2,2)),(2,2))`(**compose 后 (8,8) 块变成单 atom CLayout 原样嵌入**——即 10_mma_traits 手算的那个 `((2,2,2),(2,2,2))`,「砖」被复用的字面证据)→Step4 `(((2,2,2),(2,2)),((2,2,2),(1,1)))`(块排布拆进线程/值两侧;值侧 (1,1) stride 0 = 没加值)。
 - **实测印证(练习 `11_tiled_mma.cpp` RC=0)**:
   - `tiled_product((4,2):(1,16), (2,2):(2,1))` = `((4,2),2,2):((1,16),8,4)`,求值得 0-31 全出现,四象限偏移 +0/+4/+8/+12。`complement(atom,32)=4:4`。
   - 1x1x1→8线程 VMNK `((4,2),1,1,1):(...,0,0,0)`;2x2x1→32线程 `((4,2),2,2,1):((1,16),4,8,0)`;**2x2 + `Tile<32,32,4>` 的 VMNK 与 2x2 完全相同**→证实「加值不改 VMNK」。

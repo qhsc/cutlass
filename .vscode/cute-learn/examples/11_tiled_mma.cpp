@@ -40,6 +40,7 @@ void run()
     // (b) complement 单独看: atom 线程留下的空缺怎么排
     auto comp = complement(atom_thrid, Int<32>{});
     dump_1d("complement(atom,32)", comp);
+    dump_1d("composotion(comp, b)", composition(comp, atom_layout));
     // (c) tiled_product: TiledMMA 真正用的
     auto tp = tiled_product(atom_thrid, atom_layout);
     dump_1d("tiled_product   ", tp);
@@ -106,10 +107,50 @@ void run()
 } // namespace ex_ctv
 
 // ---------------------------------------------------------------------------
+namespace ex_thrfrg {
+// 印证: thrfrg_C 的 4 步流水线, 逐步 print C layout 的变形。
+// 手动复现源码 mma_atom.hpp:252 的 4 步 (以 2x2 TiledMMA, C=(16,16) 为例)。
+void run()
+{
+    print("=== 4) thrfrg_C 4 步变形 (复用单 atom CLayout 铺满 tile) ===\n");
+    using Op = SM70_8x8x4_F32F16F16F32_NT;
+    auto atom_ctv = typename MMA_Traits<Op>::CLayout{};    // 单 atom (T8,V8)->(m,n)
+    print("单 atom CLayout_TV = "); print(atom_ctv); print("\n\n");
+
+    // 输入: 整块 C 的 layout (16,16) 列主
+    auto C = make_layout(make_shape(_16{}, _16{}));
+    print("输入 C layout      = "); print(C); print("\n");
+
+    // Step1: Permutation 重排 (默认恒等, 这里 tile= atom 的 M/N 复制后尺寸 16)
+    //   为聚焦, 直接跳过 perm(恒等), 从 Step2 开始演示核心变形。
+
+    // Step2: 按 atom 尺寸 8x8 切块 -> ((AtomM,AtomN),(RestM,RestN))
+    using ShapeMNK = typename MMA_Traits<Op>::Shape_MNK;
+    auto c_tile   = make_tile(make_layout(size<0>(ShapeMNK{})),   // 8
+                              make_layout(size<1>(ShapeMNK{})));  // 8
+    auto c_tensor = zipped_divide(C, c_tile);
+    print("Step2 切 8x8 块    = "); print(c_tensor);
+    print("   -> ((AtomM,AtomN),(RestM,RestN)) = 一个 atom 块 + 2x2 块排布\n");
+
+    // Step3: (m,n)->(thr,val), 用单 atom CLayout compose
+    auto tv_tensor = c_tensor.compose(atom_ctv, _);
+    print("Step3 compose CLayout = "); print(tv_tensor);
+    print("   -> ((ThrV,FrgV),(RestM,RestN)) 块内坐标换成(线程,值)\n");
+
+    // Step4: 把 2x2 块排布归到线程维 (ThrM=ThrN=2)
+    auto thr_tile   = make_tile(_, make_tile(make_layout(_2{}), make_layout(_2{})));
+    auto thr_tensor = zipped_divide(tv_tensor, thr_tile);
+    print("Step4 归线程维     = "); print(thr_tensor);
+    print("   -> ((ThrV,(ThrM,ThrN)),(FrgV,(RestM,RestN))) 线程/值彻底分开\n");
+}
+} // namespace ex_thrfrg
+
+// ---------------------------------------------------------------------------
 int main()
 {
     ex_expand::run();
     ex_tmma::run();
     ex_ctv::run();
+    ex_thrfrg::run();
     return 0;
 }

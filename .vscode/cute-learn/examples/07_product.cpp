@@ -51,6 +51,18 @@ void run()
     print("行方向: A0=2:5, B0=3:1\n");
     print("列方向: A1=5:1, B1=4:3\n\n");
 
+    auto blk_logic = logical_product(A,B);
+    print("blk_logic = "); print(blk_logic); print("\n");
+
+    auto blk_zip = zipped_product(A,B);
+    print("blk_zip = "); print(blk_zip); print("\n");
+
+    auto blk_flat = flat_product(A,B);
+    print("blk_flat = "); print(blk_flat); print("\n");
+
+    auto blk_til = tiled_product(A,B);
+    print("blk_til = "); print(blk_til); print("\n");
+
     auto blk = blocked_product(A, B);
     print("blocked_product = "); print(blk); print("\n");
     print("  形状 = "); print(shape(blk));
@@ -90,6 +102,32 @@ void run()
 }
 } // namespace ex_prodtiler
 
+namespace ex_prodtable {
+
+using namespace cute;
+// 复现文档那张「四变体表」——前提: 必须用尖括号 Tiler <TileM,TileN> (by-mode)!
+// 若用单个 layout B, product 把 A/B 各当一整块, 得 ((整个A),(整个B)), 不逐方向配对, 对不上表。
+// by-mode 才会对 A 的每个 mode 分别 product -> 逐方向交错 ((M,TileM),(N,TileN))。
+void run()
+{
+    //  block A = (M,N) = (4,6),  Tiler = <TileM,TileN> = <2:1, 3:1>
+    auto A     = Layout<Shape<_4,_6>, Stride<_1,_4>>{};
+    auto Tiler = make_tile(Layout<_2,_1>{},    // TileM: M 方向复制 2 份
+                           Layout<_3,_1>{});   // TileN: N 方向复制 3 份
+    print("block A = (M,N)=(4,6),  Tiler = <2:1, 3:1> (尖括号 by-mode)\n\n");
+
+    print("logical = "); print(logical_product(A, Tiler));
+    print("   = ((M,TileM),(N,TileN))   逐方向交错\n");
+    print("zipped  = "); print(zipped_product (A, Tiler));
+    print("   = ((M,N),(TileM,TileN))   M/N 聚一起、Tile 聚一起\n");
+    print("tiled   = "); print(tiled_product  (A, Tiler));
+    print("   = ((M,N),TileM,TileN)     第二组拆开\n");
+    print("flat    = "); print(flat_product   (A, Tiler));
+    print("   = (M,N,TileM,TileN)       全拆平\n");
+    print("\n对比: 单 layout B 时 logical=((整个A),(整个B)), 无逐方向配对 (见 prodtiler)\n");
+}
+} // namespace ex_prodtable
+
 int main() {
   cute::print("\n##### product #####\n");
   ex_product::run();
@@ -97,5 +135,7 @@ int main() {
   ex_prod2d::run();
   cute::print("\n##### prodtiler #####\n");
   ex_prodtiler::run();
+  cute::print("\n##### prodtable (四变体表, 需尖括号 Tiler) #####\n");
+  ex_prodtable::run();
   return 0;
 }
