@@ -344,7 +344,250 @@ $$
 
 ---
 
-## 6. Tensor 的限制
+## 6. Tensor view 操作：CTA tile 与线程 partition
+
+这些操作只构造新的 **Tensor view**：改变 engine 的起点和 layout，不搬运数据。真正的数据搬运由后续 `copy(src,dst)` 完成。
+
+### 6.1 共同底层：`zipped_divide` 后切一个 mode
+
+标准 `zipped_divide` 接收一个数据 layout $T$ 和 tiler $B$：
+
+$$
+D=\operatorname{zipped\_divide}(T,B)
+  =\big(\underbrace{\text{Tile}}_{\text{tile 内坐标}},
+         \underbrace{\text{Rest}}_{\text{tile 编号}}\big)
+$$
+
+若 $B$ 是 Layout，它的 **shape 和 stride 都参与 divide**。若 $B$ 只是 Shape，则它会被解释成 compact tiler。
+
+在 $D$ 上有两种基本切片：
+
+| 基本操作 | 切片 | 固定 | 保留 |
+| --- | --- | --- | --- |
+| `inner_partition(T,B,q)` | $D(\_,q)$ | Rest 中的第 $q$ 个 tile | 一个完整 Tile |
+| `outer_partition(T,B,p)` | $D(p,\_)$ | Tile 内第 $p$ 个位置 | 该位置跨所有 tile 的 Rest |
+
+**1-D 最小例**：$T=16{:}1$，$B=4{:}1$：
+
+$$
+D(u,r)=T(u+4r)
+$$
+
+所以：
+
+$$
+\begin{aligned}
+D(\_,2)&=[8,9,10,11] &&\text{第 2 个完整 tile}\\
+D(2,\_)&=[2,6,10,14] &&\text{所有 tile 内的位置 2}
+\end{aligned}
+$$
+
+`local_tile` 建立在 inner partition 上；`local_partition` 建立在 outer partition 上。但两者不只是切片方向不同，它们构造 divide tiler 的方式也不同。
+
+### 6.2 `local_tile(T,B,q)`：选择一个 CTA tile
+
+`local_tile` 将调用者给出的完整 tiler $B$ 原样交给 `zipped_divide`，再固定 Rest 坐标 $q$：
+
+$$
+\boxed{
+\operatorname{local\_tile}(T,B,q)
+=\operatorname{zipped\_divide}(T,B)(\_,q)
+}
+$$
+
+这里：
+
+- $B$ 决定 tile 内怎样取数据；
+- $q$ 是 tile 编号，不是 tile 内元素坐标；
+- 输出保留 Tile mode。
+
+当 $B$ 是 Shape / Tile tuple、对 $T$ 的各 mode 分别使用 compact tiler
+$B=(b_0,\ldots,b_{r-1})$ 时：
+
+$$
+\operatorname{local\_tile}(T,B,q)(u)
+=T(u_0+b_0q_0,\ldots,u_{r-1}+b_{r-1}q_{r-1})
+$$
+
+这里必须区分两类长得相似、代数含义却不同的参数：
+
+| 第二参数 | `logical_divide` 的行为 |
+| --- | --- |
+| Shape / Tile tuple，如 `make_shape(_32,_8)` | 对 $T$ 的对应 mode 分别 divide |
+| 单个 Layout，如 `Layout<Shape<_32,_8>,Stride<_1,_32>>` | 把它作为一个整体 tiler，与 $T$ 的整个逻辑域 composition |
+
+所以“一个 Layout 的 shape 是 tuple”不等于“它是一个 by-mode tiler tuple”。源码也对应两个不同重载：`logical_divide(Layout,Tuple)` 使用 `transform_layout` 逐 mode 处理；`logical_divide(Layout,Layout)` 直接计算整体 composition。
+
+非 compact tiler 必须按真正的 Layout Algebra 计算。例如：
+
+$$
+\operatorname{zipped\_divide}(16{:}1,4{:}2)
+=(4,(2,2)):(2,(1,8))
+$$
+
+于是：
+
+$$
+\begin{aligned}
+\operatorname{local\_tile}(T,4{:}2,0)&=[0,2,4,6]\\
+\operatorname{local\_tile}(T,4{:}2,1)&=[1,3,5,7]
+\end{aligned}
+$$
+
+这说明 $B$ 的 stride $2$ 确实进入了数据 divide，而不是被忽略。
+
+**投影版本**：`local_tile(T,B,q,Step)` 先按 `Step` 选出与 $T$ 对应的 $B,q$ mode，再执行上述运算。例如 `Step<_1,X,_1>` 选择第 $0,2$ mode，跳过第 $1$ mode。
+
+**SGEMM A 的实例**：
+
+$$
+\begin{aligned}
+mA &: (M,K):(d_M,d_K)\\
+B&=(128,128,8),\qquad q=(\texttt{blockIdx.x},\texttt{blockIdx.y},\_)\\
+gA&=\operatorname{local\_tile}(mA,B,q,\texttt{Step<\_1,X,\_1>})
+\end{aligned}
+$$
+
+投影后使用 $(128,8)$ 和 $(\texttt{blockIdx.x},\_)$：
+
+$$
+\begin{aligned}
+gA &: (128,8,K/8):(d_M,d_K,8d_K)\\
+gA(m,k,k_t)&=mA(m+128\,\texttt{blockIdx.x},\ k+8k_t)
+\end{aligned}
+$$
+
+M 的 tile 编号被固定进 view 起点；K 的 Rest 坐标 $k_t$ 被保留，供 mainloop 遍历。
+
+### 6.3 `local_partition(T,P,t)`：选择一个 worker fragment
+
+这里 $P$ 不是数据 tiler，而是 ThreadLayout：
+
+$$
+P:\ \text{worker coordinate}\longrightarrow\text{physical worker id}
+$$
+
+`local_partition` 分三步：
+
+$$
+\begin{aligned}
+B_P&=\operatorname{product\_each}(\operatorname{shape}(P))
+&&\text{构造 compact 数据 tiler}\\
+p&=P^{-1}(t)
+&&\text{将物理 worker id 反查为 worker 坐标}\\
+\operatorname{local\_partition}(T,P,t)
+&=\operatorname{zipped\_divide}(T,B_P)(p,\_)
+&&\text{固定 Tile，保留 Rest}
+\end{aligned}
+$$
+
+因此精确定义是：
+
+$$
+\boxed{
+\operatorname{local\_partition}(T,P,t)
+=\operatorname{zipped\_divide}
+ \big(T,\operatorname{product\_each}(\operatorname{shape}(P))\big)
+ \big(P^{-1}(t),\_\big)
+}
+$$
+
+源码中的 $P^{-1}(t)$ 写作 `P.get_flat_coord(t)`。教程里的 ThreadLayout 是 compact 双射，因此每个 `threadIdx.x` 都能唯一反查到一个 worker 坐标。
+
+`product_each` 只乘平每个顶层 mode 的内部层次，保留顶层 rank：
+
+$$
+\operatorname{product\_each}(2,(3,4),5)=(2,12,5)
+$$
+
+它不是总乘积 $2\times3\times4\times5=120$。这样层次化的 ThreadLayout shape 才能转换成“每个数据 mode 有多少个 worker”的普通 tiler。
+
+对 2-D CTA Tensor $T=(M,K)$ 和 $\operatorname{shape}(P)=(P_M,P_K)$，若 $p=P^{-1}(t)=(p_M,p_K)$：
+
+$$
+\begin{aligned}
+T_t &: (M/P_M,K/P_K)\\
+T_t(i,j)&=T(p_M+P_Mi,p_K+P_Kj)
+\end{aligned}
+$$
+
+也就是说，ThreadLayout 的 shape 决定怎样分数据，ThreadLayout 的 stride 决定哪个物理线程取得哪一份。
+
+**SGEMM A 的实例**：
+
+$$
+tA=(32,8):(1,32),\qquad
+(p_M,p_K)=tA^{-1}(t)=(t\bmod32,\lfloor t/32\rfloor)
+$$
+
+对 $gA=(128,8,K/8):(1,5120,40960)$：
+
+$$
+\begin{aligned}
+B_{tA}&=(32,8)\Longleftrightarrow\langle32{:}1,8{:}1\rangle\\
+tAgA&:(4,1,K/8):(32,0,40960)\\
+tAgA(i,0,k_t)&=gA(p_M+32i,p_K,k_t)
+\end{aligned}
+$$
+
+`tAsA = local_partition(sA,tA,t)` 产生对应的 smem fragment view，因而 `copy(tAgA(_,_,k_t),tAsA)` 让每个线程搬运自己的 4 个 A 元素。
+
+### 6.4 两个接口的精确对比与坐标空间
+
+$$
+\underbrace{mA}_{\text{完整 gmem Tensor}}
+\xrightarrow{\ \operatorname{local\_tile}\ }
+\underbrace{gA}_{\text{一个 CTA tile}}
+\xrightarrow{\ \operatorname{local\_partition}\ }
+\underbrace{tAgA}_{\text{一个 thread fragment}}
+$$
+
+| | `local_tile(T,B,q)` | `local_partition(T,P,t)` |
+| --- | --- | --- |
+| 输入 layout 的语义 | $B$ 是数据 tiler | $P$ 是 worker-id layout |
+| 实际 divide tiler | 完整 $B$（shape+stride） | $\operatorname{product\_each}(\operatorname{shape}(P))$ |
+| 选择坐标 | 直接使用 $q$ | 先算 $P^{-1}(t)$ |
+| slice | $D(\_,q)$ | $D(P^{-1}(t),\_)$ |
+| 输出 | 一个完整 tile | 一个 worker fragment |
+
+这里有三个不能混用的坐标空间：
+
+| 对象 | 坐标空间 | stride 的含义 |
+| --- | --- | --- |
+| 数据 tiler $B$ | Tensor 逻辑数据坐标 | tile 内怎样采样数据；直接进入 divide |
+| tile 坐标 $q$ | divide 后的 Rest / tile-grid 坐标 | 选择哪个 tile |
+| ThreadLayout $P$ | worker coordinate $\to$ physical id | 只用于从 $t$ 反查 worker 坐标，不进入 divide |
+
+这就是 stride 混用风险的统一结论：
+
+- `local_tile` 中，$B.stride$ **会进入** `zipped_divide`，所以 $B$ 必须真的是数据 tiler。
+- `local_partition` 中，$P.stride$ **不会进入** `zipped_divide`，只参与 $P^{-1}(t)$。
+- BlockLayout / ThreadLayout 的 id stride 都不能被当成 Tensor 数据采样 stride。
+
+例如 $tA=(32,8):(1,32)$ 中的 $32$ 表示 K-worker 坐标加 1 时，物理 tid 加 32：
+
+$$
+tA^{-1}(0)=(0,0),\qquad
+tA^{-1}(32)=(0,1),\qquad
+tA^{-1}(64)=(0,2)
+$$
+
+它不表示数据 K 坐标跳 32。数据 K-mode 做的是：
+
+$$
+8{:}5120\ \oslash\ 8{:}1
+$$
+
+而不是 $8{:}5120\oslash8{:}32$。
+
+如果 CTA 网格由 $Q:\text{tile-grid coordinate}\to\text{block id}$ 编码，也应先算 $q=Q^{-1}(\texttt{blockIdx.x})$，再把 $q$ 交给 `local_tile`；不能把 $Q.stride$ 塞进数据 tiler $B$。
+
+**代码验证**（`examples/12_local_tile_partition.cpp`）：
+
+- $T=16{:}1$ 使用 $B=4{:}2$ 时，两个 local tile 分别取 `[0,2,4,6]` 和 `[1,3,5,7]`，证明 $B.stride$ 进入 divide。
+- $P_1=(2,4):(1,2)$ 与 $P_2=(2,4):(4,1)$ 得到相同的 divide layout，但 `tid=1` 反查出的 worker 坐标不同，证明 $P.stride$ 只进入 $P^{-1}(t)$。
+
+### 6.5 Tensor 的限制
 
 $$
 \begin{aligned}

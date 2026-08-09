@@ -36,18 +36,19 @@
 
 ## 环境(已全部跑通)
 
-- 仓库根:`/cpfs/user/baiheng/code/cutlass`
+- 仓库根:`/home/rain/code/cutlass`
 - 练习目录:`.vscode/cute-learn/`
-- CUDA:`/usr/local/cuda`(nvcc 12.9),纯 layout 代码不需要 GPU 即可编译运行。
+- 当前 GPU：NVIDIA GeForce RTX 5080（程序实测报告 SM120、84 SM）；编译 GPU
+  示例使用 `-arch=sm_120`。旧的 L20Z/SM89 记录已经过时。
+- CUDA:`/usr/local/cuda`；纯 layout 代码不需要 GPU 即可编译运行。
 - 已配好:
   - `.vscode/c_cpp_properties.json`(include path + `__CUDACC__`,IntelliSense 用)
   - `.vscode/cute-learn/Makefile`
   - `.vscode/tasks.json`
 
-**练习文件组织(已压缩归档)**:所有示例按主题合并进 `.vscode/cute-learn/examples/`
-下 7 个文件, 编号即学习顺序:`01_layout` `02_tuple` `03_coalesce`
-`04_composition` `05_complement` `06_divide`
-`07_product`。每个原示例在文件内独立 namespace(`ex_xxx::run()`),末尾 main 顺序调用。
+**练习文件组织**：示例按主题放在 `.vscode/cute-learn/examples/`，编号即学习
+顺序；基础代数从 `01_layout` 到 `07_product`，后续已增加 Tensor、Algorithms、
+MMA 与 `12_local_tile_partition.cpp` 等验证文件。
 
 **编译运行(在 `examples/` 目录)**:
 
@@ -85,10 +86,13 @@
 ## 当前进度
 
 - [x] 方向确认、路线定案、环境搭好、编译链路跑通
-- [x] 见过第一张 layout 图:`(8,4):(1,8)`
-      = 列主序映射:偏移 = 行×stride[0] + 列×stride[1] = 行×1 + 列×8
-- [ ] **进行中的练习**:把 `.vscode/cute-learn/examples/01_layout.cpp`。
-- [ ] 尚未正式开讲 01_layout.md 的完整内容
+- [x] Layout 基础、Tuple/静态表示、Tensor、Algorithms 与 Layout Algebra 主体
+- [ ] MMA Atom / Traits 已完成大量源码与打印验证，TiledMMA 进阶部分仍在继续
+- [x] **`sgemm1` 已学完**：独立学习文件为
+      `.vscode/cute-learn/gemm/sgemm1.cu`，注释已逐项复核；SM120 编译产物放在
+      `.vscode/cute-learn/build/sgemm1`
+- [ ] 下一步：进入 `sgemm_2.cu`（pipeline / 更明确的异步 copy 组织），或按需要先补
+      predication / 数值 reference 验证
 
 ## 已掌握的概念
 
@@ -582,10 +586,12 @@
       = 在寄存器开 4×8 临时 buffer;GEMM 每线程的累加器 C 即此。
   - **指针 tagging(`make_gmem_ptr`/`make_smem_ptr`)**:给迭代器贴「内存空间」标签,写进 tensor 类型。不贴也能跑,但贴了 CuTe 才能**编译期 dispatch 到最快 copy**(如
     `cp.async`/TMA 硬性要求 src=gmem、dst=smem)并**校验没接错内存**。
-  - **⚠️ 坑(实测)**:`make_tensor` 传**裸数组** `float A[64]`
-    会被当数组类型报错 (`array must be initialized with a brace-enclosed initializer`)→ 传**指针**
+- **⚠️ 坑(实测)**:`make_tensor` 传**裸数组** `float A[64]`
+  会被当数组类型报错 (`array must be initialized with a brace-enclosed initializer`)→ 传**指针**
     `float* p=A; make_tensor(p,...)`。
   - 练习:`.vscode/cute-learn/examples/08_tensor.cpp`。
+
+- **⚠️ C++ 变量名不可取 `_`（CuTe slice sentinel 遮蔽坑）**：`cute::_` 是真正的 Underscore 对象，用于 `make_coord(..., _)` / Tensor slice 表示“保留该 mode”。若在同一作用域把函数参数也命名为 `_`，局部变量会遮蔽 `cute::_`；例如把未使用的 `CSmemLayout` 参数写成 `CSmemLayout _` 后，`make_coord(blockIdx.x, blockIdx.y, _)` 的第 3 项竟变成一个 C-smem Layout，而非 Underscore，`local_tile` 随后尝试拿 Layout 当坐标运算并爆出深层 `Layout * int` / `make_tensor undefined` 模板错误。守则：未使用参数保持**未命名**或取 `unused_sC_layout`；必要时显式写 `cute::_`。
 
 - **Tensor 三种访问 + slice(切子张量)**:文档 `03_tensor.md`。
   - **访问**:`t(变参坐标)` / `t[make_coord(...)]` /
@@ -607,19 +613,36 @@
     |           | 切法                            | 保留      | 语义                                        | 别名              |
     | --------- | ------------------------------- | --------- | ------------------------------------------- | ----------------- |
     | **inner** | `tiled(make_coord(_,_), coord)` | tile 内容 | 「给我第(bx,by)块整块」粗粒度→CTA           | `local_tile`      |
-    | **outer** | `tiled(idx, make_coord(_,_))`   | rest 编号 | 「给每线程它在各 tile 的落点」细粒度→thread | `local_partition` |
-  - **为何方向相反**:inner 保 tile 内容、遍历 tile 编号(分给 block);outer 固定线程、遍历它在各 tile 的落点(分给 thread)。
+    | **outer** | `tiled(thread_coord, make_coord(_,_))` | Rest fragment | 「固定每 tile 内的线程 lane，保留所有重复」细粒度→thread | `local_partition` |
+  - **为何方向相反**:inner 固定 Rest/tile 编号、保 Tile 内容(分给 block);outer 固定 Tile/线程坐标、保 Rest fragment(分给 thread)。
+  - **★统一洞察（源码+代码实测后的精确版）**:`local_tile` 与
+    `local_partition` 都是 `zipped_divide + slice`，但不只差 slice 位置，还差
+    **divide tiler 的构造方式**：
+    - `local_tile(T,B,q)`：将完整 $B$（shape+stride）原样传给
+      `zipped_divide`，再做 `D(_,q)`；$B$ 是数据坐标空间中的 tiler，其 stride
+      会真实影响数据采样。
+    - `local_partition(T,P,t)`：先用
+      `product_each(shape(P))` 构造 compact 数据 tiler，再用
+      `P.get_flat_coord(t)`（数学上记作 $P^{-1}(t)$）反查 worker 坐标，最后做
+      `D(P^{-1}(t),_)`。$P.stride$ 属于 physical-thread-id 空间，只参与反查，
+      **不进入 divide**。
+    - 还要区分 Shape/Tile tuple 与单个 Layout：前者触发 by-mode divide；即使
+      shape 是 tuple，单个 Layout 仍会作为整体 tiler 与 Tensor 的整个逻辑域
+      composition。`local_tile(gA,tA,0)` 的代码实验验证了这一点。
   - 实测:`tiled(mc(_,_),(1,2))` 与 `local_tile(T,tiler,(1,2))` **地址完全相同**
     → 证实 local_tile =
     inner_partition 别名。inner 块起点 offset 用 zipped 后 mode 的 stride 算(`1*4+2*64=132`)与实测指针偏移吻合。
-  - `local_partition(T, Layout, Idx)` =
-    rank-sensitive 的 outer 包装:用 Layout 的逆把 Idx 转成 Coord, 再按 Layout 顶层 shape 造 Tiler
-    → 可指定行主/列主/任意的线程排布来划分。
+  - `local_partition(T,Layout,Idx)` 是 outer 包装：用 Layout 的逆把 Idx 转成
+    worker Coord，再按 `product_each(shape(Layout))` 造数据 Tiler。改变
+    ThreadLayout stride 会改变“物理线程领取哪份 fragment”，不会改变 divide
+    layout 或每份 fragment 的 shape。
   - **两级划分**:GEMM 先 `local_tile` 把大矩阵分给 CTA,再 `local_partition`
     把 tile 分给线程。
   - **TV-partition(thread-value)**:造一个 TV-layout 把 (线程id, 值id)→目标数据坐标,`composition(A, tv_layout)`
     变形后 slice 线程维 → 每线程拿到它那几个值(按 TV 规定的形状/顺序)。MMA 里线程拿寄存器片段用此。
-  - 练习:`.vscode/cute-learn/examples/08_tensor.cpp`。
+  - 练习:`.vscode/cute-learn/examples/08_tensor.cpp`、
+    `.vscode/cute-learn/examples/12_local_tile_partition.cpp`；完整标准说明见
+    `.vscode/cute-learn/algebra_reference.md` 第 6 章。
 
 - **⚠️ 设计约束:Tensor 只能 divide,不能 product**:文档 `03_tensor.md`。
   - `composition / logical_divide / zipped_divide / tiled_divide / flat_divide`
@@ -676,6 +699,42 @@
   `C=α(A·B)+βC`);
   `fill(t,v)`→全填标量;`clear(t)`→全填 0(累加器 C 计算前必清)。练习
   `09_algorithms.cpp`。
+
+### GEMM Tutorial（`sgemm1.cu`，已完成）
+
+- **学习文件**：`.vscode/cute-learn/gemm/sgemm1.cu`。已从接口到 epilogue
+  逐行学习并复核注释；只修改 `.vscode/cute-learn/` 内的学习材料，不改仓库外部
+  教程源码。编译产物统一放进 `.vscode/cute-learn/build/`，不提交 Git。
+- **完整骨架**：host 选择 NT/TN stride → 构造完整 gmem Tensor →
+  `local_tile` 分给 CTA → `local_partition(tA/tB)` 分配 gmem→smem copy →
+  `local_partition(tC)` 构造计算/写回 view → K-tile mainloop → `axpby` epilogue。
+- **统一矩阵语义**：kernel 始终把 A/B/C 看作 `(M,K)`、`(N,K)`、`(M,N)`，
+  计算 $C(m,n)=\sum_k A(m,k)B(n,k)$。NT/TN 只改变 stride，不改变 mode
+  位置；`ldA/ldB` 是底层二维存储相邻主维之间的 leading dimension。
+- **CTA 切块**：`cta_tiler=(128,128,8)`，
+  `cta_coord=(blockIdx.x,blockIdx.y,_)`；得到
+  `gA=(128,8,k_tiles)`、`gB=(128,8,k_tiles)`、`gC=(128,128)`。
+  K 的 Rest mode 保留给 mainloop 遍历。
+- **copy partition**：`tA=tB=(32,8):(1,32)` 有 256 个 worker。
+  `local_partition` 使用 compact 数据 tiler `(32:1,8:1)`，不使用
+  ThreadLayout 的 `(1,32)` 作为数据 stride。对实际
+  `gA=(128,8,512):(1,5120,40960)`，每线程得到
+  `tAgA=(4,1,512):(32,0,40960)`；`tAsA` 具有对应 fragment shape，故每轮
+  每线程搬 4 个 A 元素。B 同理。
+- **compute partition**：`tC=(16,16):(1,16)` 将 128×128 C tile 分成每线程
+  8×8 accumulator；投影后的 `tCsA=(8,8)`、`tCsB=(8,8)` 提供该线程计算所需
+  的 A 行/B 行数据，`make_tensor_like(tCgC)` 创建寄存器累加器。
+- **同步语义**：`cp_async_fence` 提交当前线程的潜在 async group；
+  `cp_async_wait<0>` 只等待当前线程自己的 group；第一个 `__syncthreads()` 保证
+  CTA 全体写完 smem 后再读，第二个保证全体读完后下一轮才能覆盖 smem。
+- **epilogue**：`axpby(alpha,tCrC,beta,tCgC)` 写出
+  $C=\alpha AB^T+\beta C$；当 beta=0 时实现会避免读取旧 C。
+- **教学版限制**：无边界 predicate，要求 M/N/K 分别被 128/128/8 整除；
+  单缓冲、默认 `UniversalFMA`，尚无 Tensor Core MMA 或 copy/compute pipeline；
+  当前程序取回结果但没有 CPU/cuBLAS reference 数值比较。
+- **易错点已经掌握**：未使用的 `CSmemLayout` 不是 C 的 smem buffer；参数不能
+  命名 `_` 以免遮蔽 `cute::_`；三个 ThreadLayout 的 size 必须相等，因为实际
+  kernel block 只有同一组物理线程。
 
 ### MMA Atom
 
@@ -768,6 +827,13 @@
 
 ### MMA:TiledMMA(把 atom 铺成大 tile)
 
+- **已完成第一小步：`make_tiled_mma` 参数①②与「加 atom = 加线程」**（`0t_mma_atom.md:436-466`，练习 `11_tiled_mma.cpp` 已重新编译 RC=0）。
+  - `make_tiled_mma(atom, AtomLayoutMNK, PermutationMNK)`：① atom 是硬件最小 MMA；② `AtomLayoutMNK` 指定 atom 沿 M/N/K 的复制位置，因此决定新增哪些线程；③第三参才是最终逻辑 tile 的尺寸/排列，若它比 atom 覆盖范围大，扩大的是每线程的 value fragment，而非线程数。
+  - 单 atom 用 `(1,1,1)`：8 个 Volta quadpair 线程、逻辑 tile `8x8x4`。2x2x1 atom 用文档的 n-major `Layout<(2,2,1):(2,1,0)>`：4 个 atom × 8 线程 = 32 线程、逻辑 tile `16x16x4`。其 `ThrLayoutVMNK=((4,2),2,2,1):((1,16),8,4,0)`：M-copy 使物理线程号加 8（T8），N-copy 加 4（T4），两个都加为 T12；四份 atom 正好填满一个 warp 的四个 quadpair。
+  - **为何能从散线程拼满 warp**：`tiled_product(AtomThrID, AtomLayoutMNK)` 先由 `complement((4,2):(1,16),32)=4:4` 找到 quadpair 留出的空位，再按 atom layout 将复制品放入。因此并非手写「T4/T8」规则，而是 layout 代数自动把 atom 的线程空缺补齐。
+  - 【用途】第二参是设计“谁执行哪块 atom”的线程编址旋钮；2x2 atom 是将 HMMA atom 组成一个 warp 级 16x16x4 MMA 的标准做法。先区分它和第三参，才能避免误以为“tile 变大就需要更多线程”。
+  - **练习修正**：`11_tiled_mma.cpp` 曾把文档的 n-major atom 排列写成默认列主序；现显式写为 `(2,2,1):(2,1,0)`，使 T4/T8 所在 C 象限与文档一致。
+
 - **TiledMMA = 对 atom 做 product**(呼应统一视角:product 铺开)。`make_tiled_mma(Atom, AtomLayoutMNK, PermutationMNK)` 三参:
   - **① Atom**:用哪条硬件指令(最小单元,如 Volta 8 线程/8x8x4)。
   - **② AtomLayoutMNK**(rank-3,对应 M/N/K):atom 沿 MNK 各**复制几份、线程怎么编号**。**加 atom = 加线程**。
@@ -810,19 +876,22 @@ make_tile 坑)、logical_product(含 blocked/raked) —— 02_layout_algebra 主
 规则)、partition(inner/outer=local_tile/local_partition、TV-partition)、Tensor 只 divide 不 product。练习
 `08_tensor.cpp`。
 **04_algorithms.md 已学完**:copy(类型 dispatch→cp.async/向量化,不转置,需同步)、gemm(V/M/N/K 记号、mode 数 dispatch、B=(N,K) 约定)、axpby/fill/clear 工具。练习
-`09_algorithms.cpp`(RC=0)。 **环境重要事实**:有 GPU!8× NVIDIA
-L20Z(报告为 SM90,132
-SM)。sgemm 能真编译真跑。sgemm_1 编译命令:`cd examples/cute/tutorial && nvcc -I ../../../include -I ../../../tools/util/include -std=c++17 -arch=sm_89 --expt-relaxed-constexpr -o /tmp/sgemm_1 sgemm_1.cu`;默认 5120³ 跑出 ~31.7
-TFLOP/s。
+`09_algorithms.cpp`(RC=0)。 **当前硬件事实**：RTX 5080，程序报告 SM120、84
+SM；GPU 示例使用 `-arch=sm_120`，所有编译产物放到
+`.vscode/cute-learn/build/`。旧的 L20Z/SM89 数据不得继续使用。
+
+**`sgemm1` 已学完**：见上方「GEMM Tutorial（已完成）」；本阶段重点包括完整
+CTA/thread 两级 partition、gmem→smem copy、同步、默认 FMA mainloop 与 epilogue。
 
 **进行中:0t_mma_atom.md(按文档编号顺序学 MMA,用户要求)**。已学:四层抽象框架(Operation/Traits/Atom/
 TiledMMA)、CLayout/ALayout/BLayout 灵魂概念、Operation 层详解 + SM90 vs
 SM100 对比(FP8 例)。**★Volta 一节全部学完 + print 验证过(练习 `10_mma_traits.cpp` RC=0)**:ThrID(方向/输入域连续 0-7 输出散 / 与 CLayout 独立 / 物理→逻辑用 right_inverse 且被 get_slice 封装)、atom 只管 8 线程 TiledMMA 铺满 32、CLayout 手算(Volta 8x8x4 F32/F16)、A/B Layout(TN vs NT = 改 thread→data ownership、求 layout 的正确定义=ownership∘固定编码、命名来自 BLAS + 双 K 连续动机)——详见上「MMA Traits 层」小节各条。 **约定:后续 MMA 学习都做 SM90 vs
 SM100 对比(用户明确要求)。** 下一步:
 
-1. **下一站:TiledMMA(0t_mma_atom.md 文档 436-509 行)**。make_tiled_mma 拼 atom:1x1(单 atom)→ 2x2 铺满 warp(16x16x4,复制到 T4/T8/T12,遵循 (2,2):(2,1))→ 32x32 沿值扩(复制到 T0V8 等)→ M-mode permute(用 `(4,4,2):(1,8,4)` 做 scatter 让 m 坐标连续)。接上「32 线程怎么来的」。用 `print_latex(mma)` 可视化。
+1. **下一站:TiledMMA 的第二小步**：已完成 1x1→2x2 atom 铺满 warp/参数①②；继续文档 466-507 行：第三参把 16x16x4 扩至 32x32x4（加值、出现 T0V8 等，线程仍32），再讲 M-mode permutation `(4,4,2):(1,8,4)` 如何 scatter 令同线程 A 的 m 坐标连续。用 `print_latex(mma)` 可视化。
    - **Hopper GMMA 已学完**(见上「Hopper GMMA」小节):ThrID=`_128`、CLayout core-matrix 分层、A/B stride=0 广播、SM70→90→100 线程参与度 8→128→1 主线。
-3. 再进 `0x_gemm_tutorial.md` +
-   `sgemm_1.cu`(把 MMA/layout/partition/copy/gemm 全串进真实 GEMM)。sgemm_1 用默认 FMA;骨架吃透后把 gemm 换成 MMA_Atom。然后 sgemm_2(pipeline)。
-4. 之后按需:TMA(`0z_tma_tensors.md`)/ predication(`0y_predication.md`)。
-5. 保持打印驱动 + 手算先行 + 原理/用途双轨;一次学习量别太大(用户要求小步走)。
+2. **下一站建议：`sgemm_2.cu`**，学习显式 copy atom / pipeline 如何在
+   `sgemm1` 的同一套 CTA/thread partition 骨架上重叠搬运与计算。若希望先把
+   教学 kernel 补完整，可先做 predication 和 CPU/cuBLAS reference 验证。
+3. 之后按需:TMA(`0z_tma_tensors.md`)/ predication(`0y_predication.md`)。
+4. 保持打印驱动 + 手算先行 + 原理/用途双轨;一次学习量别太大(用户要求小步走)。

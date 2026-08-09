@@ -66,14 +66,15 @@ void run()
     print("  线程数 size = %d\n\n", int(size(mma1.get_thr_layout_vmnk())));
 
     // (b) 2x2 atom: 32 线程, 16x16x4
-    auto mma2 = make_tiled_mma(Op{}, Layout<Shape<_2,_2,_1>>{});
+    // 与 0t_mma_atom.md 一致：2x2 n-major atom 排列 (M,N):(2,1)，K 不复制。
+    auto mma2 = make_tiled_mma(Op{}, Layout<Shape<_2,_2,_1>, Stride<_2,_1,_0>>{});
     print("--- 2x2x1 atom (加线程) ---\n");
     print("  ThrLayoutVMNK = "); print(mma2.get_thr_layout_vmnk()); print("\n");
     print("  线程数 size = %d  (8 atom内 x 4 份 = 32 = 一个 warp)\n\n",
           int(size(mma2.get_thr_layout_vmnk())));
 
     // (c) 2x2 atom + Tile<32,32,4>: 线程仍 32, 但每线程多拿值 (加值不加线程)
-    auto mma3 = make_tiled_mma(Op{}, Layout<Shape<_2,_2,_1>>{}, Tile<_32,_32,_4>{});
+    auto mma3 = make_tiled_mma(Op{}, Layout<Shape<_2,_2,_1>, Stride<_2,_1,_0>>{}, Tile<_32,_32,_4>{});
     print("--- 2x2x1 atom + Tile<32,32,4> (加值) ---\n");
     print("  ThrLayoutVMNK = "); print(mma3.get_thr_layout_vmnk()); print("\n");
     print("  线程数 size = %d  (仍 32! tile 撑大靠加值, 非加线程)\n\n",
@@ -88,7 +89,7 @@ void run()
 {
     print("=== 3) TiledMMA 的 C partition: (thr_idx,val)->(m,n) ===\n");
     using Op = SM70_8x8x4_F32F16F16F32_NT;
-    auto mma = make_tiled_mma(Op{}, Layout<Shape<_2,_2,_1>>{});   // 16x16x4
+    auto mma = make_tiled_mma(Op{}, Layout<Shape<_2,_2,_1>, Stride<_2,_1,_0>>{}); // 16x16x4, n-major
 
     auto ctv = mma.get_layoutC_TV();   // (thr,val) -> C 内一维 idx
     print("LayoutC_TV = "); print(ctv); print("\n");
