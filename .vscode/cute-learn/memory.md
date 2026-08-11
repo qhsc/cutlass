@@ -91,8 +91,12 @@ MMA 与 `12_local_tile_partition.cpp` 等验证文件。
 - [x] **`sgemm1` 已学完**：独立学习文件为
       `.vscode/cute-learn/gemm/sgemm1.cu`，注释已逐项复核；SM120 编译产物放在
       `.vscode/cute-learn/build/sgemm1`
-- [ ] 下一步：进入 `sgemm_2.cu`（pipeline / 更明确的异步 copy 组织），或按需要先补
-      predication / 数值 reference 验证
+- [x] **`sgemm2` 已学完**：独立学习文件为
+      `.vscode/cute-learn/gemm/sgemm2.cu`；已掌握 TiledCopy/TiledMMA partition、
+      gmem→rmem→smem 寄存器预取流水及相关 layout algebra
+- [ ] **下一步路线已改定**：先学 `media/docs/cpp/cute/0y_predication.md`，再学
+      `media/docs/cpp/cute/0z_tma_tensors.md`；Hopper → Blackwell GEMM 教程整体顺延，
+      **不学习 `sgemm_sm70.cu` / `sgemm_sm80.cu`**
 
 ## 已掌握的概念
 
@@ -736,6 +740,49 @@ MMA 与 `12_local_tile_partition.cpp` 等验证文件。
   命名 `_` 以免遮蔽 `cute::_`；三个 ThreadLayout 的 size 必须相等，因为实际
   kernel block 只有同一组物理线程。
 
+### GEMM Tutorial（`sgemm2.cu`，已完成）
+
+- **相对 sgemm1 的核心升级**：裸 ThreadLayout 被 `TiledCopy` / `TiledMMA`
+  取代。二者都把「最小 Atom 做什么」与「Atom 如何在线程/数据上铺开」分层；
+  `get_slice(threadIdx.x)` 固定物理线程，`partition_S/D/A/B/C` 直接生成该线程的
+  source、destination 与 MMA fragment。【用途】今后只换架构专属 Copy/MMA Atom，
+  CTA partition 和 mainloop 的上层骨架仍可复用。
+- **fragment 最左 mode 的语义**：`(CPY,CPY_M,CPY_K)` 中 `CPY` 是一次
+  Copy Atom 吃掉的完整 value fragment；`(MMA,MMA_M/N/K)` 中 `MMA` 是一次
+  MMA Atom 所需的线程局部 A/B/C value fragment。它们不是新的矩阵数学维度；
+  后面的 M/N/K mode 才是固定线程后在 Atom 外层的重复次数。当前
+  `UniversalFMA` 是 1×1×1，故 MMA mode size=1；真正 Tensor Core atom 可让
+  A/B/C 的 MMA mode 大小各不相同。
+- **TiledCopy 的 layout algebra 已沿源码推导**：
+  `layout_mn=raked_product(thr_layout,val_layout)`，
+  `layout_tv=right_inverse(layout_mn).with_shape((size(thr),size(val)))`，
+  `tiler=product_each(shape(layout_mn))`。当前 NT 配置
+  `thr=(32,8):(1,32)`、`val=(4,1):(1,0)`，完整结果为
+  `layout_mn=((4,32),(1,8)):((256,1),(0,32))`；继而
+  `Tiler_MN=(128,8)`、`TiledLayout_TV=(256,4):(4,1)`。
+  - `logical_product(thr,val)=((32,8),(4,1)):((1,32),(256,0))`；
+    raked 再做 `zip(get<1>,get<0>)`，所以每个数据 mode 都是 Value 在内、Thread
+    在外。`layout_mn` 的 codomain 编码为 `tid + 256*vid`，故四个叶 stride 是
+    `(256,1,0,32)`；不能只算 shape 而忽略 stride。
+  - 【用途】256 线程每线程一个连续 `4×1` float fragment，合起来恰好覆盖
+    `128×8` A/B tile；相邻线程/线程内 value 都连续，服务于合并且 128-bit 的
+    gmem load。
+- **Universal 操作的定位**：`UniversalCopy<S,D>` 本质是 `dst=src`；以
+  `uint128_t` 为打包类型、float 为 Copy Atom 内部类型时，一次处理 4 个 float。
+  `UniversalFMA<D,A,B,C>` 是架构无关的 1-thread、1×1×1 标量
+  `d=a*b+c`，不是 Tensor Core。当前 TiledMMA 把它沿 MN 铺成 16×16=256
+  线程，面对 128×128×8 CTA tile 时每线程外层重复 M/N/K 各 8 次。
+- **流水线语义**：循环前预取 tile0 到 `tArA/tBrB`；稳态中先把当前 rmem tile
+  写入单份 smem，再预取下一 tile 到同一份 rmem，随后从 smem 计算当前 tile。
+  因此同一时刻是「smem=当前、rmem=下一块」；这是 gmem→rmem→smem 的软件
+  预取流水，不是 `cp.async`。循环首个 `__syncthreads()` 防止覆盖尚未读完的旧
+  smem，第二个保证新 smem 写完再计算；尾轮重复读取最后 tile 以免越界，结果不再使用。
+- **官方注释存在已确认的陈旧索引**：加入最左 `CPY/MMA` mode 后，手写展开注释
+  没有把旧二维 mode 编号右移。copy 正确循环应遍历 `size<1/2>(tArA)` 的
+  CPY_M/CPY_K；gemm 应遍历 `size<1>(tCrC)`、`size<2>(tCrC)`、
+  `size<2>(tCsA)` 的 MMA_M/N/K。真正的 `copy(...)` / `gemm(...)` 实现无误，
+  只是教程伪代码注释错误。
+
 ### MMA Atom
 
 - **MMA atom 四层抽象(0t_mma_atom.md 的骨架,先记框架)**:CuTe 驯服 tensor
@@ -883,15 +930,26 @@ SM；GPU 示例使用 `-arch=sm_120`，所有编译产物放到
 **`sgemm1` 已学完**：见上方「GEMM Tutorial（已完成）」；本阶段重点包括完整
 CTA/thread 两级 partition、gmem→smem copy、同步、默认 FMA mainloop 与 epilogue。
 
-**进行中:0t_mma_atom.md(按文档编号顺序学 MMA,用户要求)**。已学:四层抽象框架(Operation/Traits/Atom/
+**`sgemm2` 已学完**：见上方对应小节；本阶段重点是 TiledCopy/TiledMMA 的 Atom +
+铺开分层、CPY/MMA fragment mode、`raked_product → right_inverse → product_each`
+构造链，以及 gmem→rmem→smem 的单级预取流水。
+
+**`0t_mma_atom.md` 阶段进度保留（当前暂停）**。已学:四层抽象框架(Operation/Traits/Atom/
 TiledMMA)、CLayout/ALayout/BLayout 灵魂概念、Operation 层详解 + SM90 vs
 SM100 对比(FP8 例)。**★Volta 一节全部学完 + print 验证过(练习 `10_mma_traits.cpp` RC=0)**:ThrID(方向/输入域连续 0-7 输出散 / 与 CLayout 独立 / 物理→逻辑用 right_inverse 且被 get_slice 封装)、atom 只管 8 线程 TiledMMA 铺满 32、CLayout 手算(Volta 8x8x4 F32/F16)、A/B Layout(TN vs NT = 改 thread→data ownership、求 layout 的正确定义=ownership∘固定编码、命名来自 BLAS + 双 K 连续动机)——详见上「MMA Traits 层」小节各条。 **约定:后续 MMA 学习都做 SM90 vs
-SM100 对比(用户明确要求)。** 下一步:
+SM100 对比(用户明确要求)。**架构主线现改为 SM90 → SM100；SM70/SM80 的既有
+Traits/Atom 知识保留，但不再学习 `examples/cute/tutorial/sgemm_sm70.cu` 与
+`sgemm_sm80.cu`。** 当前先暂停 GEMM/进阶 MMA 主线，下一步：
 
-1. **下一站:TiledMMA 的第二小步**：已完成 1x1→2x2 atom 铺满 warp/参数①②；继续文档 466-507 行：第三参把 16x16x4 扩至 32x32x4（加值、出现 T0V8 等，线程仍32），再讲 M-mode permutation `(4,4,2):(1,8,4)` 如何 scatter 令同线程 A 的 m 坐标连续。用 `print_latex(mma)` 可视化。
-   - **Hopper GMMA 已学完**(见上「Hopper GMMA」小节):ThrID=`_128`、CLayout core-matrix 分层、A/B stride=0 广播、SM70→90→100 线程参与度 8→128→1 主线。
-2. **下一站建议：`sgemm_2.cu`**，学习显式 copy atom / pipeline 如何在
-   `sgemm1` 的同一套 CTA/thread partition 骨架上重叠搬运与计算。若希望先把
-   教学 kernel 补完整，可先做 predication 和 CPU/cuBLAS reference 验证。
-3. 之后按需:TMA(`0z_tma_tensors.md`)/ predication(`0y_predication.md`)。
-4. 保持打印驱动 + 手算先行 + 原理/用途双轨;一次学习量别太大(用户要求小步走)。
+1. **先学 predication**：阅读 `media/docs/cpp/cute/0y_predication.md`，掌握恒等
+   coordinate tensor、边界谓词的构造，以及 `copy_if` 如何让非整除 M/N/K 的 tile
+   安全访问；保持手算 + 打印验证。
+2. **再学 TMA tensor**：阅读 `media/docs/cpp/cute/0z_tma_tensors.md`，掌握 TMA
+   descriptor/tensor、gmem↔smem tile 搬运及其 layout/坐标语义，为 Hopper 教程做准备。
+3. **GEMM 教程整体顺延**：完成 0y/0z 后，先读
+   `examples/cute/tutorial/hopper/wgmma_sm90.cu` → `wgmma_tma_sm90.cu`；随后按顺序读
+   `examples/cute/tutorial/blackwell/01_mma_sm100.cu`、`02_mma_tma_sm100.cu`、
+   `03_mma_tma_multicast_sm100.cu`、`04_mma_tma_2sm_sm100.cu`、
+   `05_mma_tma_epi_sm100.cu`，重点追踪 UMMA/tmem、TMA、multicast、双 SM 与 epilogue
+   如何逐层加入。
+4. 保持打印驱动 + 手算先行 + 原理/用途双轨；一次学习量别太大（用户要求小步走）。
